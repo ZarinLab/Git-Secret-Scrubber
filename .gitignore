@@ -1,0 +1,62 @@
+# Python virtual environment
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Downloaded binaries (legacy - now uses temp directory)
+.bin/
+
+# Temporary files created by git-secret-scrubber
+# These are created in system temp directory, but list patterns in case of cleanup
+git-secret-scrubber-*/
+gitleaks-report-*.json
+gitleaks-verify-*.json
+
+# PowerShell
+*.ps1.bak
+*.ps1~
+
+# Shell scripts
+*.sh.bak
+*.sh~
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Backup branches (optional - you might want to keep these)
+# backup-before-secret-cleanup-*
+
+# Test repositories
+test-repo/
+test-*.git/
+
+# Logs
+*.log
+
+# Editor backups
+*.bak
+*.orig
+
+# gitleaks reports
+gitleaks-report.json
+gitleaks-report.sarif
+*.sarif
+
+# git-filter-repo analysis
+.git/filter-repo/
+
