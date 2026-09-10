@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <strong>A cross-platform tool to safely remove secret-containing files from Git history</strong>
+  <strong>A cross-platform tool to remove secrets from Git history — delete the file, or redact the value and keep it</strong>
 </p>
 
 <p align="center">
@@ -26,18 +26,41 @@
 
 ## What This Tool Does
 
-This tool **removes entire files** from Git history using `git filter-repo --invert-paths`. It does **not** edit file contents or surgically remove secret strings—it completely deletes selected files from all commits.
+Two modes, both driven by `git filter-repo`. Pick the one that matches what the file *is*.
+
+### `--delete-files` (default) — remove whole files
+
+Removes entire files from every commit (`filter-repo --invert-paths`). For files that exist only to hold credentials.
+
+### `--redact` — replace the values, keep the files
+
+Finds credential-shaped **values** and replaces each with `REPLACE_WITH_SECRET_NN` everywhere in history (`filter-repo --replace-text`), leaving the files and their structure intact.
 
 *Designed for developers and teams who have accidentally committed secrets and need a safe remediation workflow.*
 
-| ✅ Great For | ❌ Not For |
+| Situation | Mode |
 | --- | --- |
-| Removing entire files containing secrets from history | Editing secrets inside files (redacting specific strings) |
-| `.env`, `secrets.json`, `*.pem`, API key files | Source code with embedded passwords |
-| Configuration files with credentials | Partial file cleanup |
-| Accidentally committed key files | Fine-grained secret replacement |
+| `.env`, `secrets.json`, `*.pem` — the file is nothing but credentials | `--delete-files` |
+| A Helm `values.yaml`, `appsettings.json`, `docker-compose.yml` still in use | `--redact` |
+| Source code with an embedded password | `--redact` |
+| A key file committed by accident | `--delete-files` |
 
-If you need to edit specific strings within files (e.g., replace a password with `REDACTED`), use `git filter-repo` with `--replace-text` directly.
+**Deleting a file that is still in use is the mistake `--redact` exists to prevent.** `--delete-files` removes the configuration along with the credential, from every historical commit — so a `values.yaml` that held one password loses every setting beside it too.
+
+### Finding the values
+
+`--redact` does not trust the scanner's report alone. It sweeps **every blob in history** for credential shapes and merges that with what gitleaks found, because gitleaks' rules miss whole categories:
+
+- ADO.NET connection-string fields (`Password=…;`) are unquoted and semicolon-delimited, so rules written around quoted secrets never match them. In one real 452-commit repository this was **27 of 50** leaked values.
+- Every pattern is matched case-insensitively — a lowercase `password=` is just as real as `Password=`.
+
+It then filters out things that look like credentials but are not, because `--replace-text` rewrites a string *everywhere*: replacing an identifier corrupts content permanently. Excluded are kebab-case names (`redis-credentials`), segmented config keys (`ApiKeys_SendGridApiKeyName`, `Identity.Api.ClientSecret`), template expressions (`{{ … }}`, `${…}`), placeholders, and values without at least two character classes.
+
+The proposed list is shown **masked** — length and a three-character prefix — and you confirm before anything is rewritten. Use `--dry-run` to see it and stop.
+
+### Verifying
+
+After a `--redact` run the tool checks each value against every object in the rewritten history, and it checks that the *same search finds every value in the pre-rewrite history*. If that control fails, the search is broken and its silence afterwards proves nothing — the run reports itself unverified and exits non-zero.
 
 ---
 
@@ -77,7 +100,12 @@ If you need to edit specific strings within files (e.g., replace a password with
 |-------------|-------|
 | **Git** 2.22+ | Required for git-filter-repo compatibility |
 | **Python** 3.6+ | Used to run git-filter-repo (auto-installed in venv) |
+| **Bash** 4.0+ | Linux/macOS only. macOS ships bash 3.2 as `/bin/bash` — run `brew install bash` |
 | **gitleaks** | Optional — auto-downloaded if not installed |
+
+> **macOS note:** the script resolves `bash` from `PATH`, so a Homebrew bash is picked up
+> automatically once installed. Apple's `/bin/bash` is 3.2 and lacks associative arrays,
+> which the script needs to preserve your git remotes across the rewrite.
 
 ### Installing gitleaks (optional)
 
@@ -108,6 +136,9 @@ Download the script for your platform:
 - **Linux/macOS:** [clean-secrets.sh](https://raw.githubusercontent.com/ZarinLab/Git-Secret-Scrubber/main/clean-secrets.sh)
 
 ### Make Scripts Executable (Linux/macOS)
+
+The script is committed with the executable bit set, so a clone is ready to run. If you
+downloaded it directly with `curl` or your browser, restore it:
 
 ```bash
 chmod +x clean-secrets.sh
@@ -220,6 +251,10 @@ cd /path/to/your/repo
 
 | Option           | PowerShell                  | Bash                          | Description                                          |
 |------------------|-----------------------------|-------------------------------|------------------------------------------------------|
+| Redact values    | `-Redact`                   | `--redact`                    | Replace secret VALUES in place, keeping the files    |
+| Delete files     | `-DeleteFiles`              | `--delete-files`              | Remove whole files from history (default)            |
+| Extra secrets    | `-SecretsFrom list.txt`     | `--secrets-from list.txt`     | Additional literal values to redact, one per line    |
+| Min length       | `-MinSecretLength 12`       | `--min-secret-length 12`      | Shortest value to redact (redact mode, default 8)    |
 | Repository Path  | `"C:\path"` or `-Path`      | `/path` or `--path`           | Path to repository (positional or named argument)    |
 | Dry Run          | `-DryRun`                   | `--dry-run`                   | Preview what will be cleaned without making changes  |
 | Force            | `-Force`                    | `--force`                     | Proceed even with uncommitted changes                |
