@@ -87,6 +87,8 @@ param(
     [switch]$Redact = $false,
     [switch]$DeleteFiles = $false,
     [string]$SecretsFrom = "",
+    [string]$GitleaksConfig = "",
+    [switch]$IncludeHeadValues = $false,
     # 8, not 16: a real 10-character database password turned up in a live scrub,
     # and a higher floor would have left it in history. Length alone is a poor
     # filter -- Test-LooksLikeSecret pairs it with character-class diversity.
@@ -109,7 +111,21 @@ if ($Help) {
     Write-Host "Arguments:" -ForegroundColor Yellow
     Write-Host "  PATH              Path to the git repository to clean (optional, default: current directory)"
     Write-Host ""
+    Write-Host "Modes:" -ForegroundColor Yellow
+    Write-Host "  -DeleteFiles      Remove whole FILES from history (default)"
+    Write-Host "                    For .env, *.pem -- files that exist only to hold credentials."
+    Write-Host "  -Redact           Replace secret VALUES in place, keeping the files"
+    Write-Host "                    For files still in use, where deleting the file would"
+    Write-Host "                    delete the configuration with it."
+    Write-Host ""
     Write-Host "Options:" -ForegroundColor Yellow
+    Write-Host "  -SecretsFrom FILE      Extra literal secret values to redact, one per line"
+    Write-Host "                    (-Redact only; bypasses the identifier heuristics)"
+    Write-Host "  -MinSecretLength N     Shortest value to redact (-Redact only, default 8)"
+    Write-Host "  -GitleaksConfig FILE   gitleaks config to scan with"
+    Write-Host "                    (default: .gitleaks.toml in the repo, if present)"
+    Write-Host "  -IncludeHeadValues     Also redact values still present in HEAD"
+    Write-Host "                    (default: they are reported and SKIPPED)"
     Write-Host "  -DryRun           Preview what will be cleaned without making changes"
     Write-Host "  -Force            Proceed even with uncommitted changes"
     Write-Host "  -SkipGitleaks     Skip gitleaks detection (prompt for manual input)"
@@ -204,6 +220,30 @@ function Test-LooksLikeSecret {
     # quoted-value pattern and passed a start-anchored check.
     if ($Value.Contains('{{') -or $Value.Contains('}}') -or $Value.Contains('${')) { return $false }
 
+    # Provider tokens are segmented too, so exempt them BEFORE the identifier
+    # rules below or glpat-/SG./ghp_ values get thrown away as names.
+    if ($Value -cmatch '^(AKIA|glpat-|gh[pousr]_|SG\.|xox[baprs]-)') { return $true }
+
+    # Bracketed markers -- [REDACTED], [MASKED]. Output of a redaction stage,
+    # not input to one.
+    if ($Value.StartsWith('[')) { return $false }
+
+    # Purely alphabetic values: accessKey, secretKey, hawkUsername. Field names,
+    # not credentials -- a generated credential essentially always carries a
+    # digit or a symbol. Redacting `secretKey` rewrites the KEY of every mapping
+    # that uses it.
+    if ($Value -cmatch '^[A-Za-z]+$') { return $false }
+
+    # snake_case and SCREAMING_SNAKE_CASE identifiers: LOKI_S3_ACCESS_KEY_ID,
+    # s3_access_key, appfile_s3_bucket_key.
+    #
+    # THE RULE THAT MATTERS MOST IN A KUBERNETES REPOSITORY. Env var names and
+    # ExternalSecret remoteRef.key values are written this way. A dry run
+    # against a 5069-commit GitOps repo proposed 17 values live in HEAD, almost
+    # all of this shape. Redacting them renames the field that fetches a
+    # credential, in every commit.
+    if ($Value -cmatch '^[A-Za-z][A-Za-z0-9]*(_[A-Za-z0-9]+)+$') { return $false }
+
     # Segmented identifier paths with no digits: ApiKeys_SendGridApiKeyName,
     # Identity.Api.ClientSecret, Recaptcha:SiteKey. These are configuration KEY
     # names -- including token names that REFERENCE a vault secret rather than
@@ -232,6 +272,25 @@ function Test-LooksLikeSecret {
     return ($classes -ge 2)
 }
 
+# The gate for values gitleaks itself reported.
+#
+# Deliberately weaker than Test-LooksLikeSecret. A finding from gitleaks running
+# under the repository's OWN config has already been through a human decision:
+# the rules say what counts, the allowlists say what does not. Re-running the
+# identifier heuristics over that verdict second-guesses it with less
+# information and silently loses real credentials -- a Check Point agent token
+# (cp-<hex>) is lowercase alphanumerics and hyphens, so the kebab-case rule
+# threw it away. That miss left 21 live credentials in a repository the tool had
+# just reported as cleaned.
+function Test-LooksLikeSecretMinimal {
+    param([string]$Value)
+    if ($Value.Length -lt $script:MinSecretLen) { return $false }
+    if ($Value -cmatch '^(REPLACE|CHANGE|PLACEHOLDER|TODO|EXAMPLE|DUMMY|SAMPLE|CHANGEME|YOUR_)') { return $false }
+    if ($Value.Contains('{{') -or $Value.Contains('}}') -or $Value.Contains('${')) { return $false }
+    if ($Value.StartsWith('$') -or $Value.StartsWith('<')) { return $false }
+    return $true
+}
+
 # Harvest candidate secret values from the blob dump and the gitleaks report.
 #
 # Every pattern is case-insensitive: a lowercase `password=` is as real as
@@ -239,13 +298,14 @@ function Test-LooksLikeSecret {
 function Get-SecretCandidates {
     param([string]$BlobFile, [string]$GitleaksJson)
     $found = New-Object System.Collections.Generic.HashSet[string]
+    $trusted = New-Object System.Collections.Generic.HashSet[string]
 
     # gitleaks first: its rules carry provider-specific knowledge a generic
     # sweep does not have.
     if ($GitleaksJson -and $GitleaksJson -ne "[]" -and $GitleaksJson -ne "null") {
         try {
             foreach ($f in ($GitleaksJson | ConvertFrom-Json)) {
-                if ($f.Secret) { [void]$found.Add([string]$f.Secret) }
+                if ($f.Secret) { [void]$trusted.Add([string]$f.Secret) }
             }
         } catch { }
     }
@@ -279,16 +339,25 @@ function Get-SecretCandidates {
         }
     }
 
+    # Operator-named values go in the TRUSTED set, not the sweep. Someone
+    # listing a value by hand has already decided; running the guessing rules
+    # over that decision only overrides it.
     if ($SecretsFrom -and (Test-Path $SecretsFrom)) {
         foreach ($l in Get-Content $SecretsFrom) {
-            if ($l.Trim()) { [void]$found.Add($l.Trim()) }
+            $t = $l.Trim()
+            if ($t -and -not $t.StartsWith('#')) { [void]$trusted.Add($t) }
         }
     }
 
     # Longest first. --replace-text applies rules in file order, so a secret that
     # is a prefix of a longer one must be replaced second or it truncates the
     # longer match and leaves its tail in history.
-    return @($found | Where-Object { Test-LooksLikeSecret $_ } | Sort-Object -Property Length -Descending)
+    # Scanner findings get the minimal gate; sweep findings get the full
+    # heuristics, because nothing has vetted those.
+    $keep = New-Object System.Collections.Generic.HashSet[string]
+    foreach ($v in $trusted) { if (Test-LooksLikeSecretMinimal $v) { [void]$keep.Add($v) } }
+    foreach ($v in $found)   { if (Test-LooksLikeSecret $v)        { [void]$keep.Add($v) } }
+    return @($keep | Sort-Object -Property Length -Descending)
 }
 
 # Show a secret without printing it. Length and a three-character prefix let an
@@ -449,6 +518,15 @@ $script:PreBlobs = $null
 $script:ReplacementsFile = $null
 $script:RedactVerifyOk = $true
 $script:GitleaksRawJson = $null
+# Honour the repository's own gitleaks config. Without it the scan runs stock
+# rules, which is wrong in BOTH directions against a tuned repo: it misses the
+# shapes the repo added rules for, and it reports the values the repo
+# deliberately ALLOWLISTED. Feeding an allowlisted value to --replace-text
+# rewrites live configuration to hide something that was never secret.
+$script:GitleaksConfigFile = $GitleaksConfig
+if (-not $script:GitleaksConfigFile -and (Test-Path ".gitleaks.toml")) {
+    $script:GitleaksConfigFile = ".gitleaks.toml"
+}
 
 # Check if user already specified files via command line
 if ($manualFiles) {
@@ -980,7 +1058,8 @@ if (-not $SkipGitleaks) {
     # Use report-format and report-path for reliable JSON output
     $tempReport = Join-Path $script:TempRoot "gitleaks-report-$(Get-Random).json"
     Write-Info "Scanning entire git history (this may take a while for large repos)..."
-    $null = & $gitleaksCmd detect --source . --log-opts="--all --full-history" --no-banner --report-format json --report-path $tempReport 2>&1
+    $null = $cfgArgs = @(); if ($script:GitleaksConfigFile -and (Test-Path $script:GitleaksConfigFile)) { $cfgArgs = @("--config", $script:GitleaksConfigFile); Write-Info "Using gitleaks config: $($script:GitleaksConfigFile)" } else { Write-Warning "No gitleaks config -- stock rules only." }
+        & $gitleaksCmd detect --source . --log-opts="--all --full-history" --no-banner @cfgArgs --report-format json --report-path $tempReport 2>&1
     $gitleaksExitCode = $LASTEXITCODE
     
     # Exit code 1 means secrets found, 0 means no secrets
@@ -1105,8 +1184,13 @@ if ($manualFiles) {
     }
 }
 
-# If still no files, prompt for manual input
-if ($filesInHistory.Count -eq 0) {
+# If still no files, prompt for manual input.
+#
+# Skipped in -Redact mode: that mode never uses a file list. It sweeps every
+# blob for credential-shaped values, so "gitleaks named no files" is not a
+# reason to stop -- and prompting here consumed the confirmation input as a
+# filename, which broke every redact run where the scanner found nothing.
+if ($filesInHistory.Count -eq 0 -and $script:Mode -ne "redact") {
     Write-Host ""
     if ($SkipGitleaks) {
         Write-Info "No files specified. Please enter files to clean."
@@ -1167,7 +1251,7 @@ if ($filesInHistory.Count -eq 0) {
     }
 }
 
-if ($filesInHistory.Count -eq 0) {
+if ($filesInHistory.Count -eq 0 -and $script:Mode -ne "redact") {
     Write-Error "No valid files to clean! None of the specified files exist in git history."
     exit 1
 }
@@ -1190,6 +1274,40 @@ Export-HistoryBlobs -OutFile $script:PreBlobs
 Write-Info "Scanned $((Get-Item $script:PreBlobs).Length) bytes of history"
 
 $script:SecretValues = @(Get-SecretCandidates -BlobFile $script:PreBlobs -GitleaksJson $script:GitleaksRawJson)
+
+# Split off anything still present in the CURRENT checkout.
+#
+# --replace-text rewrites HEAD like any other commit. A value live in the
+# working tree is live CONFIGURATION; rewriting it does not hide a credential,
+# it changes what the file means, everywhere, including the commit the deploy
+# tooling reads. Against a GitOps repository that is a change to the running
+# system, made by a tool nobody thought was allowed to make one.
+#
+# It is also where the remaining false positives live, because a value in HEAD
+# is usually there on purpose: fixtures in a redaction test, an example key in
+# a scanner config, a field name.
+$headFile = Join-Path $script:GssTmpDir "head-content"
+& git archive HEAD 2>$null | Set-Content -Path $headFile -Encoding utf8 -ErrorAction SilentlyContinue
+$headText = if (Test-Path $headFile) { [System.IO.File]::ReadAllText($headFile) } else { "" }
+
+$liveVals = @($script:SecretValues | Where-Object { $headText -and $headText.Contains($_) })
+if ($liveVals.Count -gt 0) {
+    Write-Host ""
+    Write-Warning "$($liveVals.Count) value(s) are STILL PRESENT in the current checkout:"
+    Write-Host ""
+    foreach ($lv in $liveVals) { Write-Host ("  " + (Format-MaskedSecret $lv)) -ForegroundColor Gray }
+    Write-Host ""
+    if ($IncludeHeadValues) {
+        Write-Error "-IncludeHeadValues given: these WILL be rewritten in HEAD too."
+        Write-Warning "That changes live configuration. Be sure each one is a credential."
+    } else {
+        Write-Info "SKIPPED -- rewriting these would change live configuration, and a"
+        Write-Info "credential that is still live needs rotating and moving out of the"
+        Write-Info "file, which a history rewrite does not do."
+        Write-Info "Deal with them, then re-run. Use -IncludeHeadValues to override."
+        $script:SecretValues = @($script:SecretValues | Where-Object { -not ($headText -and $headText.Contains($_)) })
+    }
+}
 
 if ($script:SecretValues.Count -eq 0) {
     Write-Success "No secret values found to redact."
@@ -1442,7 +1560,8 @@ if ($gitleaksPath) {
     # Use same format as detection scan for consistency
     # Exit code 0 = no secrets, 1 = secrets found
     $verifyReport = Join-Path $script:TempRoot "gitleaks-verify-$(Get-Random).json"
-    $null = & $gitleaksCmd detect --source . --log-opts="--all --full-history" --no-banner --report-format json --report-path $verifyReport 2>&1
+    $vcfg = @(); if ($script:GitleaksConfigFile -and (Test-Path $script:GitleaksConfigFile)) { $vcfg = @("--config", $script:GitleaksConfigFile) }
+    $null = & $gitleaksCmd detect --source . --log-opts="--all --full-history" --no-banner @vcfg --report-format json --report-path $verifyReport 2>&1
     $verifyExitCode = $LASTEXITCODE
     
     # Check if report has any findings

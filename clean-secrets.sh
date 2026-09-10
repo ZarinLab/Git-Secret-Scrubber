@@ -484,10 +484,19 @@ extract_secret_candidates() {
     raw="$GSS_TMPDIR/candidates.raw"
     trusted="$GSS_TMPDIR/candidates.trusted"
 
-    # Values gitleaks reported, under whatever config is in force. Kept separate
-    # from the sweep because they are judged by looks_like_secret_minimal, not by
-    # the identifier heuristics -- see the comment on that function.
+    # Values gitleaks reported, under whatever config is in force, plus anything
+    # the operator named explicitly. Kept separate from the sweep because these
+    # are judged by looks_like_secret_minimal, not by the identifier heuristics.
+    #
+    # --secrets-from belongs HERE, not in the sweep. An operator listing a value
+    # by hand has already decided; running the guessing rules over that decision
+    # only overrides it. `LOKI_S3_ACCESS_KEY_ID` passed to --secrets-from was
+    # silently dropped by the snake_case filter, which is the one case where the
+    # user had been explicit.
     : > "$trusted"
+    if [[ -n "$SECRETS_FROM" && -f "$SECRETS_FROM" ]]; then
+        grep -vE '^[[:space:]]*(#|$)' "$SECRETS_FROM" >> "$trusted" || true
+    fi
     if [[ -n "${GITLEAKS_OUTPUT:-}" && "$GITLEAKS_OUTPUT" != "[]" && "$GITLEAKS_OUTPUT" != "null" ]]; then
         printf '%s' "$GITLEAKS_OUTPUT" | "$PYTHON_CMD" -c '
 import sys, json
@@ -526,10 +535,6 @@ except Exception:
         grep -aoiE '"?(password|passwd|pwd|secret|token|apikey)"?[[:space:]]*:[[:space:]]*"[^"]{8,}"' "$blobs" 2>/dev/null \
             | sed -E 's/^[^:]*:[[:space:]]*"//; s/"$//' || true
 
-        # Anything the operator already knows about.
-        if [[ -n "$SECRETS_FROM" && -f "$SECRETS_FROM" ]]; then
-            cat "$SECRETS_FROM"
-        fi
     } > "$raw" 2>/dev/null || true
 
     : > "$out"
