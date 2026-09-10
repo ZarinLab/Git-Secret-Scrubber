@@ -39,10 +39,14 @@ jobs:
       - name: Install ShellCheck
         run: sudo apt-get install -y shellcheck
 
-      - name: Run ShellCheck
-        run: |
-          shellcheck clean-secrets.sh || true
-          echo "✓ ShellCheck completed"
+      # `error` severity is blocking; warnings are reported but tolerated. The previous
+      # `|| true` plus an unconditional success line meant this job passed no matter what
+      # ShellCheck said, so it never reported anything.
+      - name: Run ShellCheck (warnings, non-blocking)
+        run: shellcheck -S warning clean-secrets.sh || true
+
+      - name: Run ShellCheck (errors, blocking)
+        run: shellcheck -S error clean-secrets.sh
 
   test-powershell:
     name: Test PowerShell Script
@@ -145,4 +149,80 @@ jobs:
           ../clean-secrets.sh --dry-run --skip-gitleaks || true
           echo "✓ Dry run test passed"
 
+  # Regression test for the detection path itself.
+  #
+  # Every other job here passes --skip-gitleaks, so none of them ever ran a scan. That is
+  # how three bugs shipped at once: gitleaks could not write its report on macOS and
+  # aborted, the empty report read as "no secrets", and nothing asserted otherwise. This
+  # job commits a known secret, deletes it, and fails unless the scan finds it again.
+  test-detection:
+    name: Test Detection (regression)
+    runs-on: ${{ matrix.os }}
+    needs: lint-bash
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install gitleaks
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            brew install gitleaks
+          else
+            GL_VER=8.28.0
+            curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GL_VER}/gitleaks_${GL_VER}_linux_x64.tar.gz" \
+              | tar -xz -C /usr/local/bin gitleaks
+          fi
+          gitleaks version
+
+      # The secret is committed and then deleted, so it exists only in history -- the
+      # case the tool is for. Padding commits keep `git log` output long enough that a
+      # `| head -1` check races against SIGPIPE, which is what silently dropped files.
+      #
+      # A synthetic GitLab PAT, not AWS's AKIAIOSFODNN7EXAMPLE: that one is the key from
+      # Amazon's own documentation and gitleaks allowlists it, so a fixture built on it
+      # scans clean and the test passes against a completely broken scanner.
+      - name: Create test repository with a historical secret
+        run: |
+          mkdir test-repo && cd test-repo
+          git init -q
+          git config user.email "test@example.com"
+          git config user.name "Test User"
+          # The token is assembled at runtime. A literal glpat- value in this
+          # file is itself a push-protection hit (GH013) and blocks the push,
+          # even though it is a synthetic fixture; leaked.txt still gets the
+          # whole token, which is what the scan under test has to find.
+          pfx='gl'
+          printf 'gitlab_token = %spat-K7xQ2mW9pL4vR8nT3bYz\n' "$pfx" > leaked.txt
+          git add leaked.txt && git commit -qm "add credentials"
+          for i in $(seq 1 60); do
+            echo "line $i" >> leaked.txt
+            git commit -qam "touch $i"
+          done
+          git rm -q leaked.txt && git commit -qm "remove credentials"
+          echo "placeholder" > README.md
+          git add README.md && git commit -qm "readme"
+
+      - name: Detection must find the historical secret
+        run: |
+          chmod +x clean-secrets.sh
+          # '1' = automatic detection, 'N' = decline to actually rewrite anything.
+          OUT=$(printf '1\nN\n' | ./clean-secrets.sh --path test-repo --dry-run 2>&1 || true)
+          echo "$OUT"
+          if echo "$OUT" | grep -q "No secrets detected"; then
+            echo "::error::Detection reported a clean repository, but leaked.txt is in history."
+            exit 1
+          fi
+          if ! echo "$OUT" | grep -q "leaked.txt"; then
+            echo "::error::Detection did not report leaked.txt."
+            exit 1
+          fi
+          echo "✓ Detection found the historical secret"
