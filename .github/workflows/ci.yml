@@ -226,3 +226,53 @@ jobs:
             exit 1
           fi
           echo "✓ Detection found the historical secret"
+
+  # The conformance and regression suites: every option, every guard, and one
+  # fixture per finding of the 2026-09-17 review, run against BOTH scripts.
+  #
+  # They existed before this job did, and nothing ran them -- so the PowerShell
+  # port could re-encode the object dump, or read a failed gitleaks run as
+  # clean, with every CI job green. Each suite exits non-zero on any FAIL.
+  #
+  # macOS runs them twice over in effect: the tool under Homebrew bash, and the
+  # R8 test under Apple's /bin/bash 3.2, which must be refused up front.
+  test-conformance:
+    name: Conformance + regressions (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: lint-bash
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install git-filter-repo, gitleaks and (macOS) a current bash
+        run: |
+          python -m pip install --quiet git-filter-repo
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            brew install bash gitleaks
+          else
+            GL_VER=8.28.0
+            curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GL_VER}/gitleaks_${GL_VER}_linux_x64.tar.gz" \
+              | sudo tar -xz -C /usr/local/bin gitleaks
+          fi
+          command -v bash && bash --version | head -1
+          gitleaks version
+          git filter-repo --version
+          pwsh --version
+
+      - name: Bash conformance suite
+        run: bash tests/api-conformance.sh "$RUNNER_TEMP" </dev/null
+
+      - name: Bash regression suite
+        run: bash tests/regressions.sh "$RUNNER_TEMP" </dev/null
+
+      - name: PowerShell conformance + regression suite
+        run: bash tests/api-conformance-ps.sh "$RUNNER_TEMP" </dev/null

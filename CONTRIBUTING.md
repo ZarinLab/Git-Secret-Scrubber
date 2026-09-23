@@ -193,7 +193,8 @@ Before submitting, test:
 - [ ] `--skip-gitleaks` / `-SkipGitleaks` works
 - [ ] Virtual environment creation works
 - [ ] Remote preservation and restoration works
-- [ ] Backup branch is created correctly
+- [ ] NO backup branch is created (it would be rewritten with everything else)
+- [ ] `tests/api-conformance.sh`, `tests/regressions.sh` and `tests/api-conformance-ps.sh` pass
 - [ ] Error handling works (test with invalid inputs)
 
 ### Test Scenarios

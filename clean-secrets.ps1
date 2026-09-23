@@ -37,6 +37,14 @@
     Lines starting with # are treated as comments.
     Example: -FilesFrom "files-to-clean.txt"
 
+.PARAMETER Yes
+    Answer the final "Type YES" confirmation, for non-interactive runs. With
+    -Files/-FilesFrom it also selects every listed file. Guards still refuse.
+
+.PARAMETER Replacement
+    -Redact only: replace every value with this literal text instead of the
+    numbered REPLACE_WITH_SECRET_NN placeholders.
+
 .PARAMETER Help
     Show help message with all available options.
 
@@ -89,9 +97,14 @@ param(
     [string]$SecretsFrom = "",
     [string]$GitleaksConfig = "",
     [switch]$IncludeHeadValues = $false,
+    [switch]$Yes = $false,
+    # Empty = the numbered REPLACE_WITH_SECRET_NN placeholders. Whether it was
+    # GIVEN is read from $PSBoundParameters, because an explicit empty string
+    # is refused rather than treated as "not given".
+    [string]$Replacement = "",
     # 8, not 16: a real 10-character database password turned up in a live scrub,
     # and a higher floor would have left it in history. Length alone is a poor
-    # filter -- Test-LooksLikeSecret pairs it with character-class diversity.
+    # filter -- Get-HeuristicRejectReason pairs it with character-class diversity.
     [int]$MinSecretLength = 8,
     [switch]$SkipGitleaks = $false,
     [switch]$NoDownload = $false,
@@ -126,6 +139,11 @@ if ($Help) {
     Write-Host "                    (default: .gitleaks.toml in the repo, if present)"
     Write-Host "  -IncludeHeadValues     Also redact values still present in HEAD"
     Write-Host "                    (default: they are reported and SKIPPED)"
+    Write-Host "  -Replacement TEXT      Replace every value with TEXT (-Redact only)"
+    Write-Host "                    (default: REPLACE_WITH_SECRET_NN, numbered per value)"
+    Write-Host "  -Yes              Answer the final 'Type YES' confirmation, for"
+    Write-Host "                    non-interactive runs. With -Files/-FilesFrom it also"
+    Write-Host "                    selects every listed file. Guards still refuse."
     Write-Host "  -DryRun           Preview what will be cleaned without making changes"
     Write-Host "  -Force            Proceed even with uncommitted changes"
     Write-Host "  -SkipGitleaks     Skip gitleaks detection (prompt for manual input)"
@@ -145,6 +163,12 @@ if ($Help) {
     Write-Host "  .\clean-secrets.ps1 -FilesFrom cleanup.txt      # Read files from cleanup.txt"
     Write-Host "  .\clean-secrets.ps1 -SkipGitleaks               # Skip detection, enter files manually"
     Write-Host "  .\clean-secrets.ps1 -NoDownload                 # Disable auto-download of gitleaks"
+    Write-Host ""
+    Write-Host "Exit status:" -ForegroundColor Yellow
+    Write-Host "  0  done (or nothing to do), and verified"
+    Write-Host "  1  error, refused by a guard, or the rewrite could not be verified"
+    Write-Host "  3  -Redact: value(s) live in HEAD were SKIPPED, so the repository"
+    Write-Host "     still holds them (see -IncludeHeadValues)"
     Write-Host ""
     Write-Host "For full documentation, use: Get-Help .\clean-secrets.ps1 -Full" -ForegroundColor Gray
     Write-Host ""
@@ -177,62 +201,105 @@ function Initialize-GssTmpDir {
     New-Item -ItemType Directory -Path $script:GssTmpDir -Force | Out-Null
 }
 
-# Concatenate every blob in history into one file.
+# Run a native command and write its stdout to a file BYTE FOR BYTE.
+#
+# Not `git ... | Set-Content`. PowerShell decodes a native command's output
+# into strings -- with [Console]::OutputEncoding, on Windows usually an OEM code
+# page -- splits it into lines, and Set-Content re-encodes what is left. A dump
+# that went through that is no longer the repository's bytes: a UTF-8 password
+# came out as mojibake, was harvested as mojibake, and the replacement rule
+# built from it matched nothing -- so the real value survived the rewrite.
+#
+# WorkingDirectory is set explicitly because Set-Location does not move the
+# process's own current directory, which is what a child process inherits.
+function Invoke-NativeToFile {
+    param([string]$FilePath, [string[]]$ArgumentList, [string]$OutFile)
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $FilePath
+    # Arguments, not ArgumentList: ArgumentList does not exist on Windows
+    # PowerShell 5.1's .NET Framework.
+    $psi.Arguments = ($ArgumentList | ForEach-Object {
+        if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
+    }) -join ' '
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.WorkingDirectory = (Get-Location).Path
+    $proc = [System.Diagnostics.Process]::Start($psi)
+    # stderr drained concurrently, or a chatty child blocks on a full pipe.
+    $errTask = $proc.StandardError.ReadToEndAsync()
+    $fs = [System.IO.File]::Create($OutFile)
+    try { $proc.StandardOutput.BaseStream.CopyTo($fs) } finally { $fs.Dispose() }
+    $proc.WaitForExit()
+    [void]$errTask.Result
+    return $proc.ExitCode
+}
+
+# Concatenate every object in the repository into one file -- blobs, and also
+# commits and annotated tags.
 #
 # Used twice: to harvest candidate secrets, and afterwards to prove each one is
 # gone. The gitleaks report alone is not enough for either job -- its rules miss
 # whole categories of credential (see Get-SecretCandidates).
-function Export-HistoryBlobs {
+#
+# Blobs alone are not enough either: a commit message or a tag annotation is
+# an object too, and pushes like any other. A token pasted into a commit
+# message survived the rewrite while a blob-only check reported it gone.
+# --batch-all-objects also reads UNREACHABLE objects; the rewrite's gc prunes
+# them, so for verification that only makes the check stricter.
+#
+# A failure must not read as an empty repository: an empty dump harvests
+# nothing, and "nothing found" is the answer that ends a scrub.
+function Export-HistoryObjects {
     param([string]$OutFile)
     Initialize-GssTmpDir
-    $idx = Join-Path $script:GssTmpDir "blob-index"
-    # One --batch pass rather than a cat-file per blob: on a repo with real
-    # history the per-blob loop takes minutes where this takes a second. The
-    # interleaved "<sha> blob <size>" headers are harmless -- the file is only
-    # ever searched for literal secret values.
-    git rev-list --objects --all 2>$null |
-        ForEach-Object { ($_ -split ' ')[0] } |
-        git cat-file --batch-check='%(objectname) %(objecttype)' 2>$null |
-        Where-Object { $_ -match '\sblob$' } |
-        ForEach-Object { ($_ -split ' ')[0] } |
-        Sort-Object -Unique | Set-Content -Path $idx -Encoding ascii
-    Get-Content $idx | git cat-file --batch --buffer 2>$null | Set-Content -Path $OutFile -Encoding utf8
-    Remove-Item $idx -ErrorAction SilentlyContinue
+    $rc = Invoke-NativeToFile -FilePath "git" -ArgumentList @("cat-file", "--batch-all-objects", "--batch", "--unordered") -OutFile $OutFile
+    if ($rc -ne 0 -or -not (Test-Path $OutFile) -or (Get-Item $OutFile).Length -eq 0) {
+        Write-Error "Could not read the repository's objects (git cat-file --batch-all-objects)."
+        return $false
+    }
+    return $true
 }
 
 # Decide whether a captured string is a credential or an identifier.
 #
 # Erring permissive is not cosmetic: --replace-text rewrites the string
 # EVERYWHERE, so redacting an identifier corrupts that content permanently.
-function Test-LooksLikeSecret {
+#
+# Erring the other way is worse because it is SILENT: a rejected value stays
+# in history and nothing says so. So this returns the RULE that rejected the
+# value ("" = accepted), and every rejection is listed for the operator.
+# `Password=summerholiday;` was dropped by the alphabetic rule while the dry
+# run reported "No secret values found".
+function Get-HeuristicRejectReason {
     param([string]$Value)
-    if ($Value.Length -lt $script:MinSecretLen) { return $false }
+    if ($Value.Length -lt $script:MinSecretLen) { return "shorter than -MinSecretLength ($($script:MinSecretLen))" }
 
     # Placeholders and template expressions hold no credential.
     # -cmatch, not -match: PowerShell's -match is case-INSENSITIVE by default,
     # which is the opposite of bash's =~ and would reject any value merely
     # starting with the letters "change" or "sample" in any casing.
-    if ($Value -cmatch '^(REPLACE|CHANGE|PLACEHOLDER|TODO|EXAMPLE|DUMMY|SAMPLE|CHANGEME|YOUR_|xxx|XXX)') { return $false }
-    if ($Value.StartsWith('$') -or $Value.StartsWith('<') -or $Value.StartsWith('lookup(') -or $Value.StartsWith('process.env.')) { return $false }
+    if ($Value -cmatch '^(REPLACE|CHANGE|PLACEHOLDER|TODO|EXAMPLE|DUMMY|SAMPLE|CHANGEME|YOUR_|xxx|XXX)') { return "placeholder" }
+    if ($Value.StartsWith('$') -or $Value.StartsWith('<') -or $Value.StartsWith('lookup(') -or $Value.StartsWith('process.env.')) { return "variable or lookup reference" }
 
     # A template expression ANYWHERE in the value, not only at the start: a Helm
     # value like `amir-{{ include (print ...) }}` was captured whole by the
     # quoted-value pattern and passed a start-anchored check.
-    if ($Value.Contains('{{') -or $Value.Contains('}}') -or $Value.Contains('${')) { return $false }
+    if ($Value.Contains('{{') -or $Value.Contains('}}') -or $Value.Contains('${')) { return "template expression" }
 
     # Provider tokens are segmented too, so exempt them BEFORE the identifier
     # rules below or glpat-/SG./ghp_ values get thrown away as names.
-    if ($Value -cmatch '^(AKIA|glpat-|gh[pousr]_|SG\.|xox[baprs]-)') { return $true }
+    if ($Value -cmatch '^(AKIA|glpat-|gh[pousr]_|SG\.|xox[baprs]-)') { return "" }
 
     # Bracketed markers -- [REDACTED], [MASKED]. Output of a redaction stage,
     # not input to one.
-    if ($Value.StartsWith('[')) { return $false }
+    if ($Value.StartsWith('[')) { return "bracketed marker" }
 
     # Purely alphabetic values: accessKey, secretKey, hawkUsername. Field names,
     # not credentials -- a generated credential essentially always carries a
     # digit or a symbol. Redacting `secretKey` rewrites the KEY of every mapping
     # that uses it.
-    if ($Value -cmatch '^[A-Za-z]+$') { return $false }
+    if ($Value -cmatch '^[A-Za-z]+$') { return "alphabetic only (field-name shape)" }
 
     # snake_case and SCREAMING_SNAKE_CASE identifiers: LOKI_S3_ACCESS_KEY_ID,
     # s3_access_key, appfile_s3_bucket_key.
@@ -242,7 +309,7 @@ function Test-LooksLikeSecret {
     # against a 5069-commit GitOps repo proposed 17 values live in HEAD, almost
     # all of this shape. Redacting them renames the field that fetches a
     # credential, in every commit.
-    if ($Value -cmatch '^[A-Za-z][A-Za-z0-9]*(_[A-Za-z0-9]+)+$') { return $false }
+    if ($Value -cmatch '^[A-Za-z][A-Za-z0-9]*(_[A-Za-z0-9]+)+$') { return "snake_case identifier" }
 
     # Segmented identifier paths with no digits: ApiKeys_SendGridApiKeyName,
     # Identity.Api.ClientSecret, Recaptcha:SiteKey. These are configuration KEY
@@ -250,7 +317,7 @@ function Test-LooksLikeSecret {
     # containing one. Redacting them rewrites the reference and breaks config
     # while hiding nothing. The no-digit condition keeps real segmented tokens
     # safe: a SendGrid key is segmented too, but its segments carry digits.
-    if ($Value -match '^[A-Za-z][A-Za-z0-9]*([._:]+[A-Za-z][A-Za-z0-9]*)+$' -and $Value -notmatch '[0-9]') { return $false }
+    if ($Value -match '^[A-Za-z][A-Za-z0-9]*([._:]+[A-Za-z][A-Za-z0-9]*)+$' -and $Value -notmatch '[0-9]') { return "segmented identifier (a.b / a_b / a:b, no digits)" }
 
     # kebab-case is how Kubernetes Secret names and DNS labels are written. The
     # identifier belongs in git; the credential it names lives elsewhere.
@@ -260,7 +327,7 @@ function Test-LooksLikeSecret {
     # "kebab-case" and silently dropped a live GitLab token from the redaction
     # list. The bash implementation uses =~, which is case-sensitive; this is the
     # single place the two languages disagree by default.
-    if ($Value -cmatch '^[a-z][a-z0-9]*(-[a-z0-9]+)+$') { return $false }
+    if ($Value -cmatch '^[a-z][a-z0-9]*(-[a-z0-9]+)+$') { return "kebab-case identifier" }
 
     # Character-class diversity rather than entropy: cheap, and it is what keeps
     # a short lowercase word out of a global search-and-replace.
@@ -269,12 +336,13 @@ function Test-LooksLikeSecret {
     if ($Value -cmatch '[A-Z]') { $classes++ }
     if ($Value -match '[0-9]') { $classes++ }
     if ($Value -match '[^a-zA-Z0-9]') { $classes++ }
-    return ($classes -ge 2)
+    if ($classes -lt 2) { return "fewer than 2 character classes" }
+    return ""
 }
 
 # The gate for values gitleaks itself reported.
 #
-# Deliberately weaker than Test-LooksLikeSecret. A finding from gitleaks running
+# Deliberately weaker than Get-HeuristicRejectReason. A finding from gitleaks running
 # under the repository's OWN config has already been through a human decision:
 # the rules say what counts, the allowlists say what does not. Re-running the
 # identifier heuristics over that verdict second-guesses it with less
@@ -282,23 +350,47 @@ function Test-LooksLikeSecret {
 # (cp-<hex>) is lowercase alphanumerics and hyphens, so the kebab-case rule
 # threw it away. That miss left 21 live credentials in a repository the tool had
 # just reported as cleaned.
-function Test-LooksLikeSecretMinimal {
+function Get-MinimalRejectReason {
     param([string]$Value)
-    if ($Value.Length -lt $script:MinSecretLen) { return $false }
-    if ($Value -cmatch '^(REPLACE|CHANGE|PLACEHOLDER|TODO|EXAMPLE|DUMMY|SAMPLE|CHANGEME|YOUR_)') { return $false }
-    if ($Value.Contains('{{') -or $Value.Contains('}}') -or $Value.Contains('${')) { return $false }
-    if ($Value.StartsWith('$') -or $Value.StartsWith('<')) { return $false }
-    return $true
+    if ($Value.Length -lt $script:MinSecretLen) { return "shorter than -MinSecretLength ($($script:MinSecretLen))" }
+    if ($Value -cmatch '^(REPLACE|CHANGE|PLACEHOLDER|TODO|EXAMPLE|DUMMY|SAMPLE|CHANGEME|YOUR_)') { return "placeholder" }
+    if ($Value.Contains('{{') -or $Value.Contains('}}') -or $Value.Contains('${')) { return "template expression or variable reference" }
+    if ($Value.StartsWith('$') -or $Value.StartsWith('<')) { return "template expression or variable reference" }
+    return ""
+}
+
+# The gate for the Password= field of a connection string.
+#
+# The POSITION says what the value is. After `Server=..;User Id=..;` the thing
+# in `Password=` is the password, whatever it looks like -- and people choose
+# passwords that look exactly like identifiers: `summerholiday`,
+# `my-db-pass-word`, `my_db_pass_word2`. The identifier rules exist for the
+# opposite case, a NAME sitting where a value could be, and they threw every
+# one of those away.
+#
+# So: the minimal gate plus the placeholder shapes config templating puts in
+# exactly this position -- SCREAMING_SNAKE (`FROM_VAULT`), `__TOKEN__` (Azure
+# DevOps replace-tokens), `#{Token}` (Octopus), `%VAR%`. Rejected, and listed.
+function Get-ConnStringRejectReason {
+    param([string]$Value)
+    $r = Get-MinimalRejectReason $Value
+    if ($r) { return $r }
+    if ($Value -cmatch '^[A-Z][A-Z0-9]*(_[A-Z0-9]+)+$') { return "SCREAMING_SNAKE placeholder" }
+    if (($Value.StartsWith('__') -and $Value.EndsWith('__')) -or $Value.StartsWith('#{') -or ($Value.StartsWith('%') -and $Value.EndsWith('%'))) { return "replace-token placeholder" }
+    return ""
 }
 
 # Harvest candidate secret values from the blob dump and the gitleaks report.
 #
 # Every pattern is case-insensitive: a lowercase `password=` is as real as
 # `Password=`, and matching only the capitalised form leaves secrets behind.
+$script:RejectedCandidates = @()
+$script:SecretsFromAbsent = 0
 function Get-SecretCandidates {
     param([string]$BlobFile, [string]$GitleaksJson)
     $found = New-Object System.Collections.Generic.HashSet[string]
     $trusted = New-Object System.Collections.Generic.HashSet[string]
+    $connStr = New-Object System.Collections.Generic.HashSet[string]
 
     # gitleaks first: its rules carry provider-specific knowledge a generic
     # sweep does not have.
@@ -328,6 +420,21 @@ function Get-SecretCandidates {
         @{ Rx = '(?i)"?(?:password|passwd|pwd|secret|token|apikey)"?\s*:\s*"([^"]{8,})"'; Group = 1 }
     )
 
+    # The Password= field of a CONNECTION STRING: a `;`-delimited run of
+    # key=value pairs that also names a server, a user or a database. Judged by
+    # Get-ConnStringRejectReason, not the identifier rules. The neighbouring
+    # key is what licenses that: a bare `password=x` is as often code
+    # (`password=password`) as configuration. No whitespace around `=`, which
+    # is how connection strings are written and assignments mostly are not.
+    $ck = '(?:server|data source|datasource|host|hostname|address|addr|network address|user id|userid|uid|user|username|database|initial catalog)'
+    $nq = '[^;"''<>=]'
+    $connPatterns = @(
+        # Password after a server/user/database key.
+        "(?i)(?:^|[^A-Za-z0-9_])$ck=$nq*;(?:$nq*=[^;`"'<>]*;)*\s*(?:password|pwd)=([^;`"'\s]+)",
+        # Password first, a server/user/database key after it.
+        "(?i)(?:^|[^A-Za-z0-9_])(?:password|pwd)=([^;`"'\s]+);(?:$nq*=[^;`"'<>]*;)*\s*$ck="
+    )
+
     # Streamed, not Get-Content -Raw: a large repository's blob dump does not
     # need to be held in memory in one string.
     foreach ($line in [System.IO.File]::ReadLines($BlobFile)) {
@@ -337,16 +444,31 @@ function Get-SecretCandidates {
                 if ($v) { [void]$found.Add($v) }
             }
         }
+        foreach ($rx in $connPatterns) {
+            foreach ($m in [regex]::Matches($line, $rx)) {
+                $v = $m.Groups[1].Value
+                if ($v) { [void]$connStr.Add($v) }
+            }
+        }
     }
 
     # Operator-named values go in the TRUSTED set, not the sweep. Someone
     # listing a value by hand has already decided; running the guessing rules
     # over that decision only overrides it.
-    if ($SecretsFrom -and (Test-Path $SecretsFrom)) {
+    #
+    # A value that occurs nowhere in the repository is dropped with a count.
+    # One shared list is meant to serve many repositories; a value absent from
+    # this one has nothing to redact here, and keeping it would fail the
+    # verification control, which requires every value present beforehand.
+    $script:SecretsFromAbsent = 0
+    if ($SecretsFrom) {
+        $dumpText = [System.IO.File]::ReadAllText($BlobFile)
         foreach ($l in Get-Content $SecretsFrom) {
             $t = $l.Trim()
-            if ($t -and -not $t.StartsWith('#')) { [void]$trusted.Add($t) }
+            if (-not $t -or $t.StartsWith('#')) { continue }
+            if ($dumpText.Contains($t)) { [void]$trusted.Add($t) } else { $script:SecretsFromAbsent++ }
         }
+        $dumpText = $null
     }
 
     # Longest first. --replace-text applies rules in file order, so a secret that
@@ -354,9 +476,18 @@ function Get-SecretCandidates {
     # longer match and leaves its tail in history.
     # Scanner findings get the minimal gate; sweep findings get the full
     # heuristics, because nothing has vetted those.
+    # Connection-string passwords get the minimal gate plus template
+    # placeholders. Every rejection is recorded with its rule.
     $keep = New-Object System.Collections.Generic.HashSet[string]
-    foreach ($v in $trusted) { if (Test-LooksLikeSecretMinimal $v) { [void]$keep.Add($v) } }
-    foreach ($v in $found)   { if (Test-LooksLikeSecret $v)        { [void]$keep.Add($v) } }
+    $rejected = [ordered]@{}
+    foreach ($v in $trusted) { $r = Get-MinimalRejectReason $v;    if ($r) { if (-not $rejected.Contains($v)) { $rejected[$v] = $r } } else { [void]$keep.Add($v) } }
+    foreach ($v in $connStr) { $r = Get-ConnStringRejectReason $v; if ($r) { if (-not $rejected.Contains($v)) { $rejected[$v] = $r } } else { [void]$keep.Add($v) } }
+    foreach ($v in $found)   { $r = Get-HeuristicRejectReason $v;  if ($r) { if (-not $rejected.Contains($v)) { $rejected[$v] = $r } } else { [void]$keep.Add($v) } }
+
+    # A value one gate rejected and another accepted IS being redacted, so it
+    # is not a rejection. The rest were dropped by every gate that saw them.
+    $script:RejectedCandidates = @($rejected.Keys | Where-Object { -not $keep.Contains($_) } |
+        ForEach-Object { [pscustomobject]@{ Reason = $rejected[$_]; Value = $_ } } | Sort-Object -Property Reason)
     return @($keep | Sort-Object -Property Length -Descending)
 }
 
@@ -388,6 +519,9 @@ function Test-StaleWorktrees {
     Write-Info "Remove them first:  git worktree remove <path>"
     Write-Info "Or prune abandoned ones:  git worktree prune"
     Write-Host ""
+    if ($DryRun) { return }
+    # -Yes does not answer this: it confirms the rewrite, not the override of
+    # a guard.
     if (-not $Force) {
         $wt = Read-Host "Type 'IGNORE' to rewrite anyway (not recommended)"
         if ($wt -ne "IGNORE") {
@@ -397,7 +531,72 @@ function Test-StaleWorktrees {
     }
 }
 
-# Count gitleaks findings that are NOT the placeholders this tool introduced.
+# What the values become, for messages.
+function Get-PlaceholderLabel {
+    if ($script:ReplacementSet) { return $Replacement }
+    return "REPLACE_WITH_SECRET_NN"
+}
+
+# The gitleaks allowlist regex for the placeholder. Escaped by hand, not with
+# [regex]::Escape: that also escapes spaces and '#', and gitleaks' RE2 rejects
+# `\ ` as an invalid escape -- the advice would produce a broken config.
+function Get-PlaceholderRegex {
+    if (-not $script:ReplacementSet) { return '^REPLACE_WITH_SECRET_[0-9]+$' }
+    return '^' + ([regex]::Replace($Replacement, '[\\.+*?()|\[\]{}^$]', { param($m) '\' + $m.Value })) + '$'
+}
+
+# Refuse to rewrite while the repository has stash entries.
+#
+# A stash is a pair of commits hanging off refs/stash, and its older entries
+# exist ONLY in that ref's reflog. Whether they survive a rewrite depends on
+# the filter-repo version: recent ones rewrite the stash, older ones leave it
+# pointing at pre-rewrite commits -- which keeps every secret in them alive in
+# this repository after a run that reports success. And a stash is uncommitted
+# work: a history rewrite is no place to find out what happens to it.
+function Test-StashList {
+    $entries = @(git stash list 2>$null)
+    if ($entries.Count -eq 0) { return }
+    Write-Host ""
+    if ($DryRun) {
+        Write-Warning "This repository has $($entries.Count) stash entr(y/ies). A real run will refuse"
+        Write-Warning "until they are gone."
+        Write-Host ""
+        return
+    }
+    Write-Error "This repository has $($entries.Count) stash entr(y/ies):"
+    $entries | ForEach-Object { Write-Host "    $_" }
+    Write-Host ""
+    Write-Warning "Stash entries are commits kept outside every branch. A history"
+    Write-Warning "rewrite may leave them holding the pre-rewrite content -- and the"
+    Write-Warning "secrets in it -- and it is no place to keep work in progress."
+    Write-Host ""
+    Write-Info "Save each one somewhere safe, then clear them:"
+    Write-Info "  git stash show -p stash@{0} > stash-0.patch   (one per entry)"
+    Write-Info "  git stash clear"
+    Write-Info "Nothing was changed."
+    exit 1
+}
+
+# Warn about .gitleaksignore: its entries do not survive a rewrite. Each line is
+# a fingerprint `<commit>:<file>:<rule>:<line>`, and the rewrite replaces every
+# commit SHA -- so after the run every entry suppresses nothing.
+function Test-GitleaksIgnore {
+    if (-not (Test-Path ".gitleaksignore")) { return }
+    $n = @(Get-Content ".gitleaksignore" | Where-Object { $_.Trim() -and -not $_.Trim().StartsWith('#') }).Count
+    Write-Host ""
+    Write-Warning "This repository has a .gitleaksignore ($n fingerprint(s))."
+    Write-Warning "Each fingerprint contains a commit SHA, and this rewrite changes every"
+    Write-Warning "SHA: all of them stop matching after the run."
+    Write-Info "Move each one to a .gitleaks.toml allowlist that says WHY it is allowed:"
+    Write-Host "  [[allowlists]]" -ForegroundColor Gray
+    Write-Host "  description = ""<reason this value is not a secret>""" -ForegroundColor Gray
+    Write-Host "  regexTarget = ""secret""" -ForegroundColor Gray
+    Write-Host "  regexes = ['''^<the value>$''']" -ForegroundColor Gray
+    Write-Host ""
+}
+
+# Count gitleaks findings that are NOT the placeholders this tool introduced --
+# REPLACE_WITH_SECRET_NN, or exactly the -Replacement TEXT when one was given.
 function Get-RealFindingCount {
     param([string]$Json)
     try {
@@ -407,7 +606,10 @@ function Get-RealFindingCount {
         return -1
     }
     if (-not $data) { return 0 }
-    return @($data | Where-Object { [string]$_.Secret -notmatch '^REPLACE_WITH_SECRET_[0-9]+$' }).Count
+    if ($script:ReplacementSet) {
+        return @($data | Where-Object { ([string]$_.Secret).Trim() -cne $Replacement }).Count
+    }
+    return @($data | Where-Object { ([string]$_.Secret).Trim() -cnotmatch '^REPLACE_WITH_SECRET_[0-9]+$' }).Count
 }
 
 # Prove the rewrite worked -- and prove the proof can fail.
@@ -419,8 +621,8 @@ function Get-RealFindingCount {
 function Test-Redaction {
     param([string[]]$Secrets, [string]$PreBlobs)
     Initialize-GssTmpDir
-    $post = Join-Path $script:GssTmpDir "blobs-after"
-    Export-HistoryBlobs -OutFile $post
+    $post = Join-Path $script:GssTmpDir "objects-after"
+    if (-not (Export-HistoryObjects -OutFile $post)) { return $false }
 
     $preText  = [System.IO.File]::ReadAllText($PreBlobs)
     $postText = [System.IO.File]::ReadAllText($post)
@@ -447,18 +649,60 @@ function Test-Redaction {
 
     if ($survivors -gt 0) {
         Write-Error "✗ $survivors of $($Secrets.Count) value(s) SURVIVED the rewrite."
-        Write-Info "  Restore from the backup branch and re-run."
+        Write-Info "  Do not push. Restore from the mirror clone you took before the run,"
+        Write-Info "  find out what holds them, and re-run."
         return $false
     }
-    Write-Success "✓ All $($Secrets.Count) value(s) are gone from every object in history."
+    Write-Success "✓ All $($Secrets.Count) value(s) are gone from every object -- blobs, commits and tags."
     return $true
 }
 
 # Resolve -FilesFrom against the caller's directory BEFORE changing into the repo,
 # otherwise a relative path stops resolving the moment we Set-Location and the list
-# reads as missing.
+# reads as missing. -SecretsFrom and -GitleaksConfig had the same bug, and both
+# failed SILENTLY: a missing secrets list was skipped by a Test-Path, and a
+# missing config fell back to stock rules.
 if ($FilesFrom -and -not [System.IO.Path]::IsPathRooted($FilesFrom)) {
     $FilesFrom = Join-Path (Get-Location).Path $FilesFrom
+}
+if ($SecretsFrom -and -not [System.IO.Path]::IsPathRooted($SecretsFrom)) {
+    $SecretsFrom = Join-Path (Get-Location).Path $SecretsFrom
+}
+if ($GitleaksConfig -and -not [System.IO.Path]::IsPathRooted($GitleaksConfig)) {
+    $GitleaksConfig = Join-Path (Get-Location).Path $GitleaksConfig
+}
+if ($SecretsFrom -and -not (Test-Path $SecretsFrom -PathType Leaf)) {
+    Write-Host "Error: -SecretsFrom file not found: $SecretsFrom" -ForegroundColor Red
+    exit 1
+}
+if ($GitleaksConfig -and -not (Test-Path $GitleaksConfig -PathType Leaf)) {
+    Write-Host "Error: -GitleaksConfig file not found: $GitleaksConfig" -ForegroundColor Red
+    exit 1
+}
+
+# -Replacement TEXT goes, verbatim, on the right of a filter-repo expression
+# line: `literal:<value>==><TEXT>`. filter-repo splits each line on its LAST
+# `==>`, so a TEXT containing one would split in the wrong place; a newline
+# would end the expression. Checked against the values themselves once they
+# are known. Messages name the bash spelling too: the two CLIs are one API.
+$script:ReplacementSet = $PSBoundParameters.ContainsKey('Replacement')
+if ($script:ReplacementSet) {
+    if (-not $Redact) {
+        Write-Host "Error: -Replacement (--replacement) only applies to -Redact." -ForegroundColor Red
+        exit 1
+    }
+    if ([string]::IsNullOrEmpty($Replacement)) {
+        Write-Host "Error: -Replacement (--replacement) TEXT must not be empty." -ForegroundColor Red
+        exit 1
+    }
+    if ($Replacement.Contains("`n") -or $Replacement.Contains("`r")) {
+        Write-Host "Error: -Replacement (--replacement) TEXT must be a single line." -ForegroundColor Red
+        exit 1
+    }
+    if ($Replacement.Contains('==>')) {
+        Write-Host "Error: -Replacement (--replacement) TEXT must not contain '==>' (the filter-repo expression separator)." -ForegroundColor Red
+        exit 1
+    }
 }
 
 # Change to specified path if provided
@@ -498,6 +742,13 @@ $currentBranch = git branch --show-current
 Write-Info "Current branch: $currentBranch"
 Write-Host ""
 
+# Guards run FIRST, before any prompt or scan. The worktree guard used to run
+# after the "Type YES" confirmation: an operator confirmed a rewrite and was
+# only then told it could not be done safely.
+Test-StashList
+Test-StaleWorktrees
+Test-GitleaksIgnore
+
 # ============================================================================
 # Detection Method Selection (if not specified via command line)
 # ============================================================================
@@ -518,6 +769,8 @@ $script:PreBlobs = $null
 $script:ReplacementsFile = $null
 $script:RedactVerifyOk = $true
 $script:GitleaksRawJson = $null
+# Values left out because they are live in HEAD; non-zero makes the run exit 3.
+$script:HeadSkipped = 0
 # Honour the repository's own gitleaks config. Without it the scan runs stock
 # rules, which is wrong in BOTH directions against a tuned repo: it misses the
 # shapes the repo added rules for, and it reports the values the repo
@@ -654,13 +907,15 @@ if ($status) {
             Write-Host "  - $file" -ForegroundColor Yellow
         }
         Write-Host ""
-        Write-Info "It's recommended to commit or stash these changes before cleaning git history."
+        # Not "or stash": a stash is refused outright (Test-StashList), so
+        # that advice sent people straight into the next guard.
+        Write-Info "Commit these changes, or move them out of the repository, before rewriting history."
         Write-Host ""
         
         if (-not $Force) {
             $proceed = Read-Host "Do you want to proceed anyway? (yes/no) [default: no]"
             if ([string]::IsNullOrWhiteSpace($proceed) -or ($proceed -ne "yes" -and $proceed -ne "y")) {
-                Write-Info "Aborted. Please commit or stash your changes first, or use -Force flag to skip this prompt."
+                Write-Info "Aborted. Commit your changes first, or use -Force to skip this prompt."
                 exit 0
             } else {
                 Write-Warning "Proceeding with uncommitted changes in other files..."
@@ -1061,6 +1316,11 @@ if (-not $SkipGitleaks) {
     $null = $cfgArgs = @(); if ($script:GitleaksConfigFile -and (Test-Path $script:GitleaksConfigFile)) { $cfgArgs = @("--config", $script:GitleaksConfigFile); Write-Info "Using gitleaks config: $($script:GitleaksConfigFile)" } else { Write-Warning "No gitleaks config -- stock rules only." }
         & $gitleaksCmd detect --source . --log-opts="--all --full-history" --no-banner @cfgArgs --report-format json --report-path $tempReport 2>&1
     $gitleaksExitCode = $LASTEXITCODE
+    # Only 0 and 1 are scan results. Anything else means gitleaks never
+    # completed, and its missing report must not read as a clean repository.
+    if ($gitleaksExitCode -ne 0 -and $gitleaksExitCode -ne 1) {
+        Write-Error "gitleaks did not complete (exit code $gitleaksExitCode) -- its findings are NOT included."
+    }
     
     # Exit code 1 means secrets found, 0 means no secrets
     if ((Test-Path $tempReport) -and (Get-Item $tempReport).Length -gt 0) {
@@ -1121,7 +1381,11 @@ if (-not $SkipGitleaks) {
         Remove-Item $tempReport -Force -ErrorAction SilentlyContinue
     }
     
-    if ($detectedFiles.Count -eq 0) {
+    # "No secrets detected" is a claim about a scan that RAN. After a failed
+    # one it used to print anyway, directly under the failure.
+    if ($gitleaksExitCode -ne 0 -and $gitleaksExitCode -ne 1) {
+        Write-Warning "gitleaks produced no usable result -- nothing is known from it."
+    } elseif ($detectedFiles.Count -eq 0) {
         Write-Success "No secrets detected by gitleaks!"
         Write-Host ""
         Write-Info "This could mean:"
@@ -1266,14 +1530,48 @@ if ($script:Mode -eq "redact") {
 Write-Header "Step 5: Collecting secret values to redact"
 
 Initialize-GssTmpDir
-$script:PreBlobs         = Join-Path $script:GssTmpDir "blobs-before"
+$script:PreBlobs         = Join-Path $script:GssTmpDir "objects-before"
 $script:ReplacementsFile = Join-Path $script:GssTmpDir "replacements.txt"
 
-Write-Info "Reading every blob in history..."
-Export-HistoryBlobs -OutFile $script:PreBlobs
+# The patterns and gitleaks find credential SHAPES. A value that does not have
+# one -- or has the shape of an identifier -- is found only if you name it.
+# Not mandatory, because a quick scrub of one obvious token should not need a
+# file; but a production scrub without it relies on guesswork, and says so.
+if (-not $SecretsFrom) {
+    Write-Error "╔══════════════════════════════════════════════════════════════════╗"
+    Write-Error "║  No -SecretsFrom list: only values that the patterns and         ║"
+    Write-Error "║  gitleaks recognise will be redacted. A password shaped like a   ║"
+    Write-Error "║  word or an identifier can be rejected -- check the REJECTED     ║"
+    Write-Error "║  list below, and name known values in a -SecretsFrom file.       ║"
+    Write-Error "╚══════════════════════════════════════════════════════════════════╝"
+    Write-Host ""
+}
+
+Write-Info "Reading every object in the repository (blobs, commits, tags)..."
+if (-not (Export-HistoryObjects -OutFile $script:PreBlobs)) { exit 1 }
 Write-Info "Scanned $((Get-Item $script:PreBlobs).Length) bytes of history"
 
 $script:SecretValues = @(Get-SecretCandidates -BlobFile $script:PreBlobs -GitleaksJson $script:GitleaksRawJson)
+
+if ($script:SecretsFromAbsent -gt 0) {
+    Write-Info "$($script:SecretsFromAbsent) value(s) from -SecretsFrom occur nowhere in this"
+    Write-Info "repository -- nothing to redact for them here."
+}
+
+# Every candidate a gate dropped, with the gate. This list is the only thing
+# standing between an identifier-shaped password and a report that says the
+# repository is clean.
+if ($script:RejectedCandidates.Count -gt 0) {
+    Write-Host ""
+    Write-Warning "$($script:RejectedCandidates.Count) candidate value(s) were REJECTED and will NOT be redacted:"
+    Write-Host ""
+    foreach ($rc in $script:RejectedCandidates) {
+        Write-Host ("  " + (Format-MaskedSecret $rc.Value) + "  rejected: " + $rc.Reason) -ForegroundColor Yellow
+    }
+    Write-Host ""
+    Write-Info "If any of these IS a credential, put it in a -SecretsFrom file (one"
+    Write-Info "value per line) and re-run: named values skip the identifier rules."
+}
 
 # Split off anything still present in the CURRENT checkout.
 #
@@ -1287,7 +1585,8 @@ $script:SecretValues = @(Get-SecretCandidates -BlobFile $script:PreBlobs -Gitlea
 # is usually there on purpose: fixtures in a redaction test, an example key in
 # a scanner config, a field name.
 $headFile = Join-Path $script:GssTmpDir "head-content"
-& git archive HEAD 2>$null | Set-Content -Path $headFile -Encoding utf8 -ErrorAction SilentlyContinue
+# Byte for byte, like the object dump (see Invoke-NativeToFile).
+$null = Invoke-NativeToFile -FilePath "git" -ArgumentList @("archive", "HEAD") -OutFile $headFile
 $headText = if (Test-Path $headFile) { [System.IO.File]::ReadAllText($headFile) } else { "" }
 
 $liveVals = @($script:SecretValues | Where-Object { $headText -and $headText.Contains($_) })
@@ -1305,13 +1604,35 @@ if ($liveVals.Count -gt 0) {
         Write-Info "credential that is still live needs rotating and moving out of the"
         Write-Info "file, which a history rewrite does not do."
         Write-Info "Deal with them, then re-run. Use -IncludeHeadValues to override."
+        Write-Error "This run will exit 3: the repository still holds these values."
         $script:SecretValues = @($script:SecretValues | Where-Object { -not ($headText -and $headText.Contains($_)) })
+        $script:HeadSkipped = $liveVals.Count
     }
 }
 
 if ($script:SecretValues.Count -eq 0) {
+    # "Nothing to rewrite" and "clean" are different answers: values skipped
+    # because they are live in HEAD are still in the repository.
+    if ($script:HeadSkipped -gt 0) {
+        Write-Error "Nothing left to rewrite, but $($script:HeadSkipped) value(s) live in HEAD were skipped."
+        exit 3
+    }
     Write-Success "No secret values found to redact."
     exit 0
+}
+
+# The replacement must not reproduce what it replaces. If TEXT contains a
+# value, that value is written straight back into every commit; if a value
+# contains TEXT, the two are too alike to tell apart afterwards.
+if ($script:ReplacementSet) {
+    foreach ($sec in $script:SecretValues) {
+        if ($Replacement.Contains($sec) -or $sec.Contains($Replacement)) {
+            Write-Error "-Replacement (--replacement) TEXT contains a value being replaced, or is contained in one:"
+            Write-Host ("  " + (Format-MaskedSecret $sec)) -ForegroundColor Gray
+            Write-Info "Choose a TEXT that shares nothing with the values. Nothing was changed."
+            exit 1
+        }
+    }
 }
 
 Write-Host ""
@@ -1336,7 +1657,11 @@ $lines = New-Object System.Collections.Generic.List[string]
 $i = 0
 foreach ($sec in $script:SecretValues) {
     $i++
-    $lines.Add(("literal:{0}==>REPLACE_WITH_SECRET_{1:D2}" -f $sec, $i))
+    if ($script:ReplacementSet) {
+        $lines.Add(("literal:{0}==>{1}" -f $sec, $Replacement))
+    } else {
+        $lines.Add(("literal:{0}==>REPLACE_WITH_SECRET_{1:D2}" -f $sec, $i))
+    }
 }
 # UTF8 without BOM: filter-repo reads this file byte-for-byte, and a BOM would
 # corrupt the first replacement rule.
@@ -1345,7 +1670,11 @@ foreach ($sec in $script:SecretValues) {
 if ($DryRun) {
     Write-Host ""
     Write-Success "DRY RUN MODE - No changes will be made"
-    Write-Info "Would replace the $($script:SecretValues.Count) value(s) above with REPLACE_WITH_SECRET_NN."
+    Write-Info "Would replace the $($script:SecretValues.Count) value(s) above with $(Get-PlaceholderLabel)."
+    if ($script:HeadSkipped -gt 0) {
+        Write-Error "Exiting 3: $($script:HeadSkipped) value(s) live in HEAD would be skipped."
+        exit 3
+    }
     exit 0
 }
 
@@ -1366,7 +1695,15 @@ Write-Host "  [A] All files" -ForegroundColor Green
 Write-Host "  [N] None (cancel)" -ForegroundColor Red
 Write-Host ""
 
-$selection = Read-Host "Enter file numbers (comma-separated) or 'A' for all, 'N' to cancel"
+# -Yes selects every file only when the operator LISTED them (-Files,
+# -FilesFrom): that list is already a decision. Files a scan proposed are
+# still chosen by a person.
+if ($Yes -and ($manualFiles -or $filesFromPath)) {
+    $selection = "A"
+    Write-Info "-Yes: selecting every listed file"
+} else {
+    $selection = Read-Host "Enter file numbers (comma-separated) or 'A' for all, 'N' to cancel"
+}
 
 if ($selection -eq "N" -or $selection -eq "n") {
     Write-Info "Cancelled by user."
@@ -1429,10 +1766,22 @@ Write-Error "⚠️  All commit SHAs will change!"
 Write-Error "⚠️  You will need to force push!"
 Write-Error "⚠️  All team members must re-clone the repository!"
 Write-Host ""
-$confirm = Read-Host "Type 'YES' to continue"
-if ($confirm -ne "YES") {
-    Write-Info "Aborted."
-    exit 0
+# There is no backup branch. There used to be one, created in this repository
+# just before the rewrite -- and filter-repo rewrites EVERY ref, so the
+# "backup" came out redacted along with everything else. It backed up nothing.
+$repoFull = (Get-Location).Path
+Write-Warning "BACKUP: this tool does not make one. Take it BEFORE confirming, outside"
+Write-Warning "this repository -- a mirror clone keeps every ref:"
+Write-Info "  git clone --mirror ""$repoFull"" ""$repoFull.mirror-backup.git"""
+Write-Host ""
+if ($Yes) {
+    Write-Warning "-Yes given: proceeding without the confirmation prompt."
+} else {
+    $confirm = Read-Host "Type 'YES' to continue"
+    if ($confirm -ne "YES") {
+        Write-Info "Aborted."
+        exit 0
+    }
 }
 
 # Save remote information (git-filter-repo removes remotes)
@@ -1448,31 +1797,23 @@ foreach ($remote in $remotes) {
     }
 }
 
-# A linked worktree keeps pre-rewrite objects reachable; check before rewriting
-# rather than discovering it in verification.
-Test-StaleWorktrees
-
-# Create backup branch
-Write-Host ""
-Write-Header "Step 8: Creating backup branch..."
-$backupBranch = "backup-before-secret-cleanup-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
-git branch $backupBranch
-Write-Success "Backup branch created: $backupBranch"
-
 # Rewrite history
 Write-Host ""
 if ($script:Mode -eq "redact") {
-    Write-Header "Step 9: Redacting secret values in git history..."
+    Write-Header "Step 8: Redacting secret values in git history..."
 } else {
-    Write-Header "Step 9: Removing files from git history..."
+    Write-Header "Step 8: Removing files from git history..."
 }
 Write-Info "This may take a while..."
 
 if ($script:Mode -eq "redact") {
-    $filterRepoArgs = @("--replace-text", $script:ReplacementsFile, "--force")
+    # --replace-message with the SAME expressions: --replace-text reaches file
+    # contents only, and a value pasted into a commit message or a tag
+    # annotation is pushed like any other object.
+    $filterRepoArgs = @("--replace-text", $script:ReplacementsFile, "--replace-message", $script:ReplacementsFile, "--force")
     # Deliberately not echoed with its argument expanded: the replacements file
     # is a plaintext list of every credential in the repository.
-    Write-Info "Running: git filter-repo --replace-text <replacements> --force"
+    Write-Info "Running: git filter-repo --replace-text <replacements> --replace-message <replacements> --force"
 } else {
     # Build git-filter-repo command with multiple --path arguments
     $filterRepoArgs = @("--invert-paths", "--force")
@@ -1493,19 +1834,42 @@ if ($useSystemFilterRepo) {
 if ($LASTEXITCODE -ne 0) {
     Write-Host ""
     Write-Error "ERROR: git-filter-repo failed!"
-    Write-Warning "You can restore from backup branch: $backupBranch"
+    Write-Warning "Do not push. Restore from the mirror clone you took before the run."
     exit 1
+}
+
+# Keep the commit-map where it survives. .git/filter-repo/commit-map is the
+# old-SHA -> new-SHA table GitLab's Repository cleanup asks for; the next
+# filter-repo run overwrites it and deleting the clone deletes it. A copy
+# beside the repository outlives both.
+$commitMapSrc = Join-Path (git rev-parse --git-dir) (Join-Path "filter-repo" "commit-map")
+if (-not [System.IO.Path]::IsPathRooted($commitMapSrc)) { $commitMapSrc = Join-Path (Get-Location).Path $commitMapSrc }
+$commitMapCopy = $null
+if ((Test-Path $commitMapSrc) -and (Get-Item $commitMapSrc).Length -gt 0) {
+    $repoDir = (Get-Location).Path
+    $parentDir = Split-Path -Parent $repoDir
+    $leaf = Split-Path -Leaf $repoDir
+    $commitMapCopy = Join-Path $parentDir "$leaf.commit-map"
+    if (Test-Path $commitMapCopy) {
+        $commitMapCopy = Join-Path $parentDir "$leaf.$(Get-Date -Format 'yyyyMMdd-HHmmss').commit-map"
+    }
+    try {
+        Copy-Item -Path $commitMapSrc -Destination $commitMapCopy -ErrorAction Stop
+    } catch {
+        Write-Warning "Could not copy the commit-map to $commitMapCopy -- keep $commitMapSrc yourself."
+        $commitMapCopy = $null
+    }
 }
 
 # Clean up
 Write-Host ""
-Write-Header "Step 10: Cleaning up git references..."
+Write-Header "Step 9: Cleaning up git references..."
 git reflog expire --expire=now --all
 git gc --prune=now --aggressive
 
 # Restore remotes (git-filter-repo removes them)
 Write-Host ""
-Write-Header "Step 11: Restoring remote configuration..."
+Write-Header "Step 10: Restoring remote configuration..."
 if ($remoteInfo.Count -gt 0) {
     foreach ($remote in $remoteInfo.Keys) {
         $remoteUrl = $remoteInfo[$remote]
@@ -1533,7 +1897,7 @@ Write-Success "========================================"
 Write-Host ""
 
 # ============================================================================
-# Step 12: Verify with gitleaks
+# Step 11: Verify with gitleaks
 # ============================================================================
 # Gated on whether gitleaks is actually available, not on $SkipGitleaks. That flag also
 # gets set by -Files and -FilesFrom, which say nothing about wanting the result left
@@ -1545,14 +1909,14 @@ Write-Host ""
 $script:RedactVerifyOk = $true
 if ($script:Mode -eq "redact") {
     Write-Host ""
-    Write-Header "Step 12a: Verifying redaction directly..."
+    Write-Header "Step 11a: Verifying redaction directly..."
     $script:RedactVerifyOk = Test-Redaction -Secrets $script:SecretValues -PreBlobs $script:PreBlobs
     Write-Host ""
 }
 
 if ($gitleaksPath) {
     Write-Host ""
-    Write-Header "Step 12: Verifying cleanup with gitleaks..."
+    Write-Header "Step 11: Verifying cleanup with gitleaks..."
     Write-Info "Running gitleaks scan to verify secrets are removed..."
     Write-Host ""
 
@@ -1566,6 +1930,7 @@ if ($gitleaksPath) {
     
     # Check if report has any findings
     $hasFindings = $false
+    $verifyContent = $null
     if ((Test-Path $verifyReport) -and (Get-Item $verifyReport).Length -gt 2) {
         $verifyContent = Get-Content $verifyReport -Raw
         if ($verifyContent -and $verifyContent -ne "[]" -and $verifyContent -ne "null") {
@@ -1573,22 +1938,29 @@ if ($gitleaksPath) {
         }
     }
     Remove-Item $verifyReport -Force -ErrorAction SilentlyContinue
-    
-    if ($verifyExitCode -eq 0 -or -not $hasFindings) {
+
+    # A scan that never ran is checked FIRST. Only 0 and 1 are scan results; any
+    # other code means gitleaks aborted without writing a report, and "no
+    # findings" in a report that does not exist used to take the success branch.
+    if ($verifyExitCode -ne 0 -and $verifyExitCode -ne 1) {
+        Write-Error "✗ Verification did NOT run (gitleaks exit code $verifyExitCode) -- this cleanup is unverified."
+        Write-Info "Re-run manually: gitleaks detect --source . --log-opts=`"--all --full-history`""
+    } elseif ($verifyExitCode -eq 0 -or -not $hasFindings) {
         Write-Success "✓ No secrets detected by gitleaks!"
     } elseif ($script:Mode -eq "redact" -and (Get-RealFindingCount $verifyContent) -eq 0) {
-        # Every remaining finding is a REPLACE_WITH_SECRET_NN placeholder.
-        # generic-api-key fires on `Password=<anything>` whatever the value is, so
-        # a successful redaction leaves a repo that scans dirty forever. Calling
-        # that "secrets still detected" trains the operator to ignore the scanner.
+        # Every remaining finding is a placeholder: REPLACE_WITH_SECRET_NN, or
+        # the -Replacement TEXT. generic-api-key fires on `Password=<anything>`
+        # whatever the value is, so a successful redaction leaves a repo that
+        # scans dirty forever. Calling that "secrets still detected" trains the
+        # operator to ignore the scanner.
         Write-Success "✓ No secrets detected by gitleaks!"
         Write-Host ""
-        Write-Info "gitleaks matched only the REPLACE_WITH_SECRET_NN placeholders."
+        Write-Info "gitleaks matched only the $(Get-PlaceholderLabel) placeholders."
         Write-Info "Allowlist them so future scans stay meaningful -- in .gitleaks.toml:"
         Write-Host ""
         Write-Host "  [[allowlists]]" -ForegroundColor Gray
         Write-Host "  description = ""Redaction placeholders left by git-secret-scrubber""" -ForegroundColor Gray
-        Write-Host "  regexes = ['''^REPLACE_WITH_SECRET_[0-9]+$''']" -ForegroundColor Gray
+        Write-Host "  regexes = ['''$(Get-PlaceholderRegex)''']" -ForegroundColor Gray
         Write-Host "  regexTarget = ""secret""" -ForegroundColor Gray
     } elseif ($verifyExitCode -eq 1) {
         # Exit code 1 means secrets were found
@@ -1641,8 +2013,33 @@ if ($remoteInfo.Count -gt 0) {
     Write-Info "  git push origin --force --all"
 }
 Write-Host ""
-Write-Info "Backup branch: $backupBranch"
+
+# GitLab keeps the old commits after the force-push. None of this is done by
+# the push, and none of it can be done from here.
+Write-Header "Commit-map and GitLab follow-up"
+if ($commitMapCopy) {
+    Write-Success "commit-map (old SHA -> new SHA) copied to:"
+    Write-Host "   $commitMapCopy" -ForegroundColor Cyan
+    Write-Info "  (original: $commitMapSrc -- overwritten by the next filter-repo run)"
+} else {
+    Write-Warning "No commit-map found at $commitMapSrc."
+}
 Write-Host ""
+Write-Info "On GitLab the force-push does NOT remove the old commits:"
+Write-Info "  - refs/merge-requests/* are read-only. Every merge request keeps its old"
+Write-Info "    head commit and its stored diff, whatever you push. An MR whose diff"
+Write-Info "    shows a secret must be deleted (not just closed) to lose it."
+Write-Info "  - refs/keep-around/* pin commits that pipelines, notes and MR diffs"
+Write-Info "    point at. Only Repository cleanup removes them."
+Write-Info "  - After the push, wait 30 minutes (cleanup skips newer objects), then:"
+Write-Info "    Settings → Repository → Repository maintenance → Repository cleanup"
+Write-Info "    (older GitLab: Settings → Repository → Repository cleanup)"
+Write-Info "    and upload the commit-map above."
+Write-Host ""
+if (Test-Path ".gitleaksignore") {
+    Write-Warning "Reminder: every .gitleaksignore fingerprint is now dead (they carry old SHAs)."
+    Write-Host ""
+}
 
 Write-Error "╔══════════════════════════════════════════════════════════════════╗"
 Write-Error "║  ⚠️  REMINDER: After force-push, ALL teammates must RE-CLONE!     ║"
@@ -1650,7 +2047,7 @@ Write-Error "║  Their local copies will be incompatible with the new history. 
 Write-Error "╚══════════════════════════════════════════════════════════════════╝"
 
 if ($script:Mode -eq "redact") {
-    Write-Info "Redacted values now read REPLACE_WITH_SECRET_NN. Allowlist that string"
+    Write-Info "Redacted values now read $(Get-PlaceholderLabel). Allowlist that string"
     Write-Info "in your gitleaks config, or every historical commit fails future scans."
     Write-Host ""
 }
@@ -1661,4 +2058,14 @@ if ($script:Mode -eq "redact" -and -not $script:RedactVerifyOk) {
     Write-Error "Exiting non-zero: redaction could not be verified."
     exit 1
 }
+# Nor may a scrub that knowingly left values behind: the ones live in HEAD
+# were skipped by design and are still in every commit that has them.
+if ($script:Mode -eq "redact" -and $script:HeadSkipped -gt 0) {
+    Write-Error "Exiting 3: $($script:HeadSkipped) value(s) live in HEAD were skipped and are still in history."
+    exit 3
+}
 Write-Host ""
+# Explicit, or the status is whatever the last native command left in
+# $LASTEXITCODE -- gitleaks' 1 for "placeholders found" -- when this script is
+# invoked from -Command or another script rather than with -File.
+exit 0

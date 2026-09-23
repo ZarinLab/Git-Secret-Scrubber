@@ -34,7 +34,7 @@ Removes entire files from every commit (`filter-repo --invert-paths`). For files
 
 ### `--redact` — replace the values, keep the files
 
-Finds credential-shaped **values** and replaces each with `REPLACE_WITH_SECRET_NN` everywhere in history (`filter-repo --replace-text`), leaving the files and their structure intact.
+Finds credential-shaped **values** and replaces each with `REPLACE_WITH_SECRET_NN` — or with one fixed text of your choice, `--replacement TEXT` — everywhere in history: file contents (`filter-repo --replace-text`) and commit and tag messages (`--replace-message`), leaving the files and their structure intact.
 
 *Designed for developers and teams who have accidentally committed secrets and need a safe remediation workflow.*
 
@@ -49,18 +49,56 @@ Finds credential-shaped **values** and replaces each with `REPLACE_WITH_SECRET_N
 
 ### Finding the values
 
-`--redact` does not trust the scanner's report alone. It sweeps **every blob in history** for credential shapes and merges that with what gitleaks found, because gitleaks' rules miss whole categories:
+`--redact` does not trust the scanner's report alone. It sweeps **every object in the repository** — file contents, commit messages, tag annotations — for credential shapes and merges that with what gitleaks found, because gitleaks' rules miss whole categories:
 
 - ADO.NET connection-string fields (`Password=…;`) are unquoted and semicolon-delimited, so rules written around quoted secrets never match them. In one real 452-commit repository this was **27 of 50** leaked values.
 - Every pattern is matched case-insensitively — a lowercase `password=` is just as real as `Password=`.
 
 It then filters out things that look like credentials but are not, because `--replace-text` rewrites a string *everywhere*: replacing an identifier corrupts content permanently. Excluded are kebab-case names (`redis-credentials`), segmented config keys (`ApiKeys_SendGridApiKeyName`, `Identity.Api.ClientSecret`), template expressions (`{{ … }}`, `${…}`), placeholders, and values without at least two character classes.
 
+Three kinds of value skip those identifier rules, because something other than their shape says what they are:
+
+- **the `Password=` field of a connection string** (`Server=…;User Id=…;Password=summerholiday;`) — the position makes it a password, however word-like. Only placeholders are dropped there (`${…}`, `FROM_VAULT`, `__TOKEN__`, `#{Token}`);
+- **gitleaks findings**, which already passed the repository's own rules and allowlists;
+- **values you name in `--secrets-from`** (one per line; trimmed, so a Windows-saved list works). Values in the list that do not occur in the repository are counted and skipped, so one list can serve many repositories.
+
+**Every rejected candidate is listed**, masked, with the rule that rejected it. If one of them is a credential, put it in a `--secrets-from` file and re-run. Without `--secrets-from` the run prints a loud warning: it is then relying on the patterns alone.
+
 The proposed list is shown **masked** — length and a three-character prefix — and you confirm before anything is rewritten. Use `--dry-run` to see it and stop.
 
 ### Verifying
 
-After a `--redact` run the tool checks each value against every object in the rewritten history, and it checks that the *same search finds every value in the pre-rewrite history*. If that control fails, the search is broken and its silence afterwards proves nothing — the run reports itself unverified and exits non-zero.
+After a `--redact` run the tool checks each value against **every object in the repository** (`git cat-file --batch-all-objects`: blobs, commits and tags), and it checks that the *same search finds every value in the pre-rewrite objects*. If that control fails, the search is broken and its silence afterwards proves nothing — the run reports itself unverified and exits non-zero.
+
+A value still present in HEAD is **skipped** by default (rewriting it changes live configuration) and the run **exits 3**, because the repository still holds it. `--include-head-values` rewrites those too.
+
+### Exit status
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Done (or nothing to do), and verified |
+| 1 | Error, refused by a guard (stash, worktree, old bash, bad option), or the rewrite could not be verified |
+| 3 | `--redact`: value(s) live in HEAD were skipped — the repository still holds them |
+
+### Recommended command for a production repository
+
+```bash
+# 1. Backup: a mirror clone, OUTSIDE the working clone. The tool does not make one.
+git clone --mirror git@gitlab.example.com:group/repo.git repo.mirror-backup.git
+
+# 2. A fresh working clone (filter-repo turns its remote branches into local ones).
+git clone git@gitlab.example.com:group/repo.git repo
+
+# 3. Preview. Read the proposed AND the rejected lists; exit 3 means values are live in HEAD.
+/opt/homebrew/bin/bash clean-secrets.sh repo --redact --dry-run \
+    --secrets-from known-values.txt --replacement replacemetext
+
+# 4. Rewrite, non-interactively.
+/opt/homebrew/bin/bash clean-secrets.sh repo --redact \
+    --secrets-from known-values.txt --replacement replacemetext --yes
+```
+
+Then push, and do the GitLab follow-up under [After Cleanup](#after-cleanup).
 
 ---
 
@@ -70,7 +108,7 @@ After a `--redact` run the tool checks each value against every object in the re
 - 🎯 **Interactive File Selection** — Choose which files to clean with an easy-to-use menu
 - ✅ **Verification** — Automatically verifies cleanup with gitleaks after completion
 - 🔄 **Remote Preservation** — Automatically saves and restores git remotes
-- 🛡️ **Safety First** — Creates backup branches before making changes
+- 🛡️ **Safety First** — Refuses to run with stash entries, linked worktrees or an old bash; tells you to take a mirror-clone backup first
 - 🌍 **Cross-Platform** — Works on Windows (PowerShell), Linux, and macOS (Bash)
 - 🐍 **Auto-Setup** — Automatically creates a temporary Python virtual environment and installs dependencies (nothing touches your system Python)
 - 📦 **Auto-Download** — Automatically downloads gitleaks if not installed (with SHA256 verification)
@@ -105,7 +143,9 @@ After a `--redact` run the tool checks each value against every object in the re
 
 > **macOS note:** the script resolves `bash` from `PATH`, so a Homebrew bash is picked up
 > automatically once installed. Apple's `/bin/bash` is 3.2 and lacks associative arrays,
-> which the script needs to preserve your git remotes across the rewrite.
+> which the script needs to preserve your git remotes across the rewrite. Run under 3.2
+> (`/bin/bash clean-secrets.sh …`), it stops before doing anything and tells you to
+> `brew install bash` and re-run with `/opt/homebrew/bin/bash`.
 
 ### Installing gitleaks (optional)
 
@@ -239,13 +279,15 @@ cd /path/to/your/repo
 
 | Step | Action | Description |
 |:----:|--------|-------------|
+| 0 | **Guards** | Refuses stash entries and linked worktrees; warns about `.gitleaksignore` |
 | 1 | **Setup** | Creates Python venv, installs git-filter-repo |
 | 2 | **Detection** | Runs gitleaks to find secrets in history |
-| 3 | **Selection** | Interactive menu to choose files |
-| 4 | **Backup** | Creates backup branch |
-| 5 | **Cleanup** | Removes files from entire git history |
+| 3 | **Selection** | Interactive menu to choose files (or the masked value list, in `--redact`) |
+| 4 | **Confirm** | Reminds you to take a `git clone --mirror` backup; `Type YES` (or `--yes`) |
+| 5 | **Cleanup** | Removes files / replaces values in the entire history |
 | 6 | **Restore** | Restores git remotes (removed by filter-repo) |
-| 7 | **Verify** | Runs gitleaks again to confirm cleanup |
+| 7 | **Verify** | Direct check of every object (`--redact`), then gitleaks |
+| 8 | **Commit-map** | Copies `.git/filter-repo/commit-map` beside the repository and prints the GitLab follow-up |
 
 ## Command Line Options
 
@@ -255,6 +297,10 @@ cd /path/to/your/repo
 | Delete files     | `-DeleteFiles`              | `--delete-files`              | Remove whole files from history (default)            |
 | Extra secrets    | `-SecretsFrom list.txt`     | `--secrets-from list.txt`     | Additional literal values to redact, one per line    |
 | Min length       | `-MinSecretLength 12`       | `--min-secret-length 12`      | Shortest value to redact (redact mode, default 8)    |
+| Replacement      | `-Replacement TEXT`         | `--replacement TEXT`          | Replace every value with TEXT instead of `REPLACE_WITH_SECRET_NN` (redact mode) |
+| HEAD values      | `-IncludeHeadValues`        | `--include-head-values`       | Also rewrite values still present in HEAD (default: skipped, exit 3) |
+| gitleaks config  | `-GitleaksConfig f.toml`    | `--gitleaks-config f.toml`    | Scan with this config (default: the repo's `.gitleaks.toml`) |
+| Non-interactive  | `-Yes`                      | `--yes`                       | Answer the final confirmation; with `--files`/`--files-from` also select them all |
 | Repository Path  | `"C:\path"` or `-Path`      | `/path` or `--path`           | Path to repository (positional or named argument)    |
 | Dry Run          | `-DryRun`                   | `--dry-run`                   | Preview what will be cleaned without making changes  |
 | Force            | `-Force`                    | `--force`                     | Proceed even with uncommitted changes                |
@@ -271,6 +317,9 @@ When you run the script, you'll be prompted to choose how to identify files:
 1. **Automatic detection** (default) — Uses gitleaks to scan git history
 2. **Comma-separated list** — Enter file paths directly
 3. **Text file** — Load paths from a file (one per line, `#` for comments)
+
+Uncommitted changes must be committed (or `--force`d past), not stashed: a run
+refuses to start while `git stash list` is non-empty.
 
 You can also skip the prompt by using command-line arguments:
 
@@ -344,13 +393,16 @@ Enter file numbers (comma-separated) or 'A' for all, 'N' to cancel: A
 ⚠️  WARNING: This will rewrite git history!
 Type 'YES' to continue: YES
 
-Step 5: Saving remote configuration...
-Step 6: Creating backup branch...
-Step 7: Removing files from git history...
-Step 8: Cleaning up git references...
-Step 9: Restoring remote configuration...
-Step 10: Verifying cleanup with gitleaks...
+Step 7: Saving remote configuration...
+Step 8: Removing files from git history...
+Step 9: Cleaning up git references...
+Step 10: Restoring remote configuration...
+Step 11: Verifying cleanup with gitleaks...
 ✓ No secrets detected by gitleaks!
+
+Commit-map and GitLab follow-up
+commit-map (old SHA -> new SHA) copied to:
+   /path/to/repo.commit-map
 ```
 
 ## Git History Rewrite Warnings
@@ -392,9 +444,18 @@ See [docs/protected-branches.md](docs/protected-branches.md) for detailed instru
    git push origin --force --tags
    ```
 
-4. **Notify your team** — Everyone must re-clone the repository
+4. **Keep the commit-map.** Every real run copies `.git/filter-repo/commit-map` (old SHA → new SHA) to `<repo>.commit-map` beside the repository, because the next filter-repo run overwrites the original.
 
-5. **Rotate secrets** — Any exposed secrets should be rotated immediately
+5. **GitLab: the push does not remove the old commits from the server.**
+   - `refs/merge-requests/*` are read-only: every merge request keeps its old head commit and its stored diff. An MR whose diff shows a secret must be *deleted* to lose it.
+   - `refs/keep-around/*` pin commits referenced by pipelines, notes and MR diffs.
+   - Wait 30 minutes after the push (cleanup ignores newer objects), then **Settings → Repository → Repository maintenance → Repository cleanup** (older GitLab: Settings → Repository → Repository cleanup) and upload the commit-map.
+
+6. **`.gitleaksignore` is dead.** Its fingerprints contain commit SHAs, and every SHA changed. Move each entry to a `.gitleaks.toml` `[[allowlists]]` block with a `description` that says why it is allowed.
+
+7. **Notify your team** — Everyone must re-clone the repository
+
+8. **Rotate secrets** — Any exposed secrets should be rotated immediately
 
 ## Troubleshooting
 
@@ -429,15 +490,26 @@ See [docs/protected-branches.md](docs/protected-branches.md) for solutions.
 
 ## How to Restore from Backup
 
-If something goes wrong, restore from the backup branch:
+**The tool does not make a backup.** Earlier versions created a
+`backup-before-secret-cleanup-*` branch in the repository just before the
+rewrite — and filter-repo rewrites every ref, so that branch was rewritten too
+and backed up nothing. Take the backup yourself, before the run, outside the
+working clone:
 
 ```bash
-# List backup branches
-git branch | grep backup-before-secret-cleanup
-
-# Restore from backup (replace with your backup branch name)
-git reset --hard backup-before-secret-cleanup-YYYYMMDD-HHMMSS
+git clone --mirror /path/to/repo /path/to/repo.mirror-backup.git
 ```
+
+If something goes wrong **before you push**, discard the working clone and
+clone again from the mirror (or from the server, which still has the old
+history). If something goes wrong **after you push**, push the mirror back:
+
+```bash
+cd /path/to/repo.mirror-backup.git
+git push --mirror --force <remote-url>   # restores every branch and tag as it was
+```
+
+Pushing the mirror back restores the secrets too — rotate them either way.
 
 ## Contributing
 

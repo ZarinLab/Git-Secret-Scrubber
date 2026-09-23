@@ -7,7 +7,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Fixes from the 2026-09-17 review of f27e18a, ahead of rewriting ~60 production
+repositories. Every item has a fixture in `tests/regressions.sh` (bash) or the
+regression block of `tests/api-conformance-ps.sh` (PowerShell) that fails
+against f27e18a and passes now.
+
 ### Added
+- **`--replacement TEXT` / `-Replacement TEXT`** (`--redact` only): every value
+  becomes TEXT instead of a numbered `REPLACE_WITH_SECRET_NN`. TEXT must be
+  non-empty, one line, free of `==>` (filter-repo's separator), and share nothing
+  with the values being replaced — a TEXT containing a value would write it back
+  into every commit. The placeholder check after the run and the printed
+  `.gitleaks.toml` allowlist both use TEXT.
+- **`--yes` / `-Yes`** answers the final confirmation for non-interactive runs.
+  With `--files`/`--files-from` it also selects every listed file; files proposed
+  by a scan are still chosen by a person, and no guard is answered by it.
+- **Exit status 3**: `--redact` skipped value(s) that are live in HEAD, so the
+  repository still holds them. It used to say "SKIPPED" and exit 0 — and a run
+  whose only findings were live exited 0 with "No secret values found".
+- **Every rejected candidate is listed**, masked, with the rule that rejected
+  it. A run without `--secrets-from` prints a loud warning that it is relying on
+  the patterns alone.
+- **The commit-map is kept.** Every real run copies `.git/filter-repo/commit-map`
+  to `<repo>.commit-map` beside the repository (the next filter-repo run
+  overwrites the original) and prints the GitLab follow-up: read-only
+  `refs/merge-requests/*`, `refs/keep-around/*`, and Repository cleanup with the
+  commit-map after a 30-minute wait.
+- **Stash guard.** A real run refuses while `git stash list` is non-empty; a dry
+  run warns. The uncommitted-changes prompt no longer advises stashing.
+- **`.gitleaksignore` warning.** Its fingerprints carry commit SHAs and are all
+  dead after a rewrite; the run says so and shows the `.gitleaks.toml`
+  allowlist shape to move them to.
+- **CI runs the conformance and regression suites** on Ubuntu and macOS, for
+  both scripts. They existed and nothing ran them. Each suite now exits non-zero
+  on any failure.
+
+### Changed
+- **No backup branch.** It was created inside the repository just before the
+  rewrite, and filter-repo rewrites every ref — so it came out redacted too and
+  backed up nothing, while the README told people to restore from it. The run
+  now tells you to take a `git clone --mirror` before confirming; README "How to
+  Restore" rewritten around the mirror.
+- **Guards run first.** The stash and worktree guards run before any prompt or
+  scan; the worktree guard used to run after "Type YES".
+- **Commit messages and tag annotations are rewritten** (`--replace-message`
+  with the same expressions) **and verified**: the direct check now reads every
+  object (`git cat-file --batch-all-objects`), not just blobs. A token in a
+  commit message used to survive while the run reported it "gone from every
+  object in history".
+- **Connection-string passwords skip the identifier rules.** In
+  `Server=…;User Id=…;Password=summerholiday;` the position says it is a
+  password; `summerholiday`, `my-db-pass-word` and `my_db_pass_word2` were all
+  dropped as identifiers and the dry run said "No secret values found". Only
+  placeholders are dropped there (`${…}`, `FROM_VAULT`, `__TOKEN__`, `#{…}`,
+  `%…%`). Values from gitleaks and `--secrets-from` already skipped them.
+- **`--secrets-from` serves many repositories.** Lines are trimmed (a list saved
+  on Windows ended every value in `\r`), and values that occur nowhere in the
+  repository are counted and skipped. Either case used to fail the verification
+  control after the history had already been rewritten.
+
+### Fixed
+- **Bash: Apple's `/bin/bash` 3.2 is refused before any work**, with
+  `brew install bash` and the command to re-run. It used to die mid-run on
+  `config_flag[@]: unbound variable`, naming neither cause nor fix.
+- **Both: a missing `--secrets-from` or `--gitleaks-config` file is an error**,
+  and relative paths resolve against the caller's directory. The list was
+  silently skipped, and the config announced as "in use" while gitleaks ran on
+  stock rules.
+- **Both: "No secrets detected by gitleaks!" printed after a failed scan** at
+  the detection step, directly under the failure.
+- **Bash: the rejected-candidates list came out empty whenever nothing was
+  accepted** — `awk 'NR == FNR'` with an empty first file (caught by its test).
+- **PowerShell: the object dump and the HEAD snapshot were re-encoded.** Piping
+  `git cat-file`/`git archive` through PowerShell decodes with the console code
+  page and `Set-Content` re-encodes: under a non-UTF-8 code page a UTF-8
+  password was harvested as mojibake, its replacement rule matched nothing, and
+  the value survived. Both are now copied byte for byte from the process stream.
+- **PowerShell: a gitleaks exit code other than 0/1 was read as a clean
+  verification.** A scan that never ran is now reported as unverified.
+- **PowerShell: the exit status leaked `$LASTEXITCODE`** from the last native
+  command when the script was invoked from `-Command`; it now ends in `exit 0`.
 - **`--redact` / `-Redact`: replace secret VALUES in place instead of deleting the file.**
   Runs `git filter-repo --replace-text`, rewriting each credential to
   `REPLACE_WITH_SECRET_NN` everywhere in history while the files and their structure

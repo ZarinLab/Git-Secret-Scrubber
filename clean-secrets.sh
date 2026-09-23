@@ -35,6 +35,8 @@
 #   --redact         Replace secret VALUES in place, keeping the files
 #   --delete-files   Remove whole files from history (default)
 #   --dry-run        Preview what will be cleaned without making changes
+#   --yes            Answer the final confirmation (for non-interactive runs)
+#   --replacement T  Replace every value with T instead of REPLACE_WITH_SECRET_NN
 #   --force          Proceed even with uncommitted changes
 #   --skip-gitleaks  Skip gitleaks detection (manually specify files)
 #   --no-download    Disable automatic downloading of gitleaks
@@ -55,6 +57,20 @@
 # Repository: https://github.com/ZarinLab/Git-Secret-Scrubber
 # Version: 0.1.0
 #
+
+# Refuse an old bash BEFORE doing anything. Under Apple's /bin/bash 3.2 the
+# script used to run for a while and then die of a symptom -- "config_flag[@]:
+# unbound variable" in the gitleaks step, or `declare -A` at Step 7 -- which
+# names neither the cause nor the fix. Written in plain POSIX test syntax so
+# this check itself parses under any bash.
+if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+    echo "ERROR: bash 4.0 or newer is required; this is bash ${BASH_VERSION:-unknown}." >&2
+    echo "  macOS ships bash 3.2 as /bin/bash. Install a current one and re-run with it:" >&2
+    echo "    brew install bash" >&2
+    echo "    /opt/homebrew/bin/bash $0 $*    (Intel Macs: /usr/local/bin/bash)" >&2
+    echo "  Nothing was changed." >&2
+    exit 1
+fi
 
 set -euo pipefail
 
@@ -78,6 +94,11 @@ MODE="delete"
 SECRETS_FROM=""
 GITLEAKS_CONFIG=""
 INCLUDE_HEAD_VALUES=false
+ASSUME_YES=false
+# Empty = the numbered REPLACE_WITH_SECRET_NN placeholders. REPLACEMENT_SET
+# separates "not given" from "given as an empty string", which is refused.
+REPLACEMENT=""
+REPLACEMENT_SET=false
 # 8, not 16. The 2026-09-10 tes-cloud-chart scrub turned up a live 10-character
 # database password; a higher floor would have left it in history. Length alone
 # is a poor filter -- looks_like_secret() pairs it with character-class
@@ -105,6 +126,15 @@ while [[ $# -gt 0 ]]; do
         --include-head-values)
             INCLUDE_HEAD_VALUES=true
             shift
+            ;;
+        --yes)
+            ASSUME_YES=true
+            shift
+            ;;
+        --replacement)
+            REPLACEMENT="$2"
+            REPLACEMENT_SET=true
+            shift 2
             ;;
         --min-secret-length)
             MIN_SECRET_LENGTH="$2"
@@ -166,6 +196,11 @@ while [[ $# -gt 0 ]]; do
             echo "  --secrets-from FILE  Extra literal secret values to redact, one per line"
             echo "                   (--redact only; merged with what gitleaks finds)"
             echo "  --min-secret-length N  Shortest value to redact (--redact only, default 8)"
+            echo "  --replacement TEXT  Replace every value with TEXT (--redact only)"
+            echo "                   (default: REPLACE_WITH_SECRET_NN, numbered per value)"
+            echo "  --yes            Answer the final 'Type YES' confirmation, for"
+            echo "                   non-interactive runs. With --files/--files-from it also"
+            echo "                   selects every listed file. Guards still refuse."
             echo "  --dry-run        Preview what will be cleaned without making changes"
             echo "  --force          Proceed even with uncommitted changes"
             echo "  --skip-gitleaks  Skip gitleaks detection (prompt for manual input)"
@@ -186,6 +221,12 @@ while [[ $# -gt 0 ]]; do
             echo "  $0 --skip-gitleaks              # Skip detection, enter files manually"
             echo "  $0 --redact                     # Redact secret values, keep the files"
             echo "  $0 --redact --dry-run           # Show what would be redacted"
+            echo ""
+            echo "Exit status:"
+            echo "  0  done (or nothing to do), and verified"
+            echo "  1  error, refused by a guard, or the rewrite could not be verified"
+            echo "  3  --redact: value(s) live in HEAD were SKIPPED, so the repository"
+            echo "     still holds them (see --include-head-values)"
             exit 0
             ;;
         *)
@@ -205,8 +246,49 @@ done
 
 # Resolve --files-from against the caller's directory BEFORE changing into the repo,
 # otherwise a relative path stops resolving the moment we cd and the list reads as missing.
+# --secrets-from and --gitleaks-config had the same bug, and both used to fail
+# SILENTLY: a missing secrets list was skipped by an `-f` test, and a missing
+# config was announced as "in use" while gitleaks ran on stock rules.
 if [[ -n "$FILES_FROM" && "$FILES_FROM" != /* ]]; then
     FILES_FROM="$PWD/$FILES_FROM"
+fi
+if [[ -n "$SECRETS_FROM" && "$SECRETS_FROM" != /* ]]; then
+    SECRETS_FROM="$PWD/$SECRETS_FROM"
+fi
+if [[ -n "$GITLEAKS_CONFIG" && "$GITLEAKS_CONFIG" != /* ]]; then
+    GITLEAKS_CONFIG="$PWD/$GITLEAKS_CONFIG"
+fi
+if [[ -n "$SECRETS_FROM" && ! -f "$SECRETS_FROM" ]]; then
+    echo "Error: --secrets-from file not found: $SECRETS_FROM"
+    exit 1
+fi
+if [[ -n "$GITLEAKS_CONFIG" && ! -f "$GITLEAKS_CONFIG" ]]; then
+    echo "Error: --gitleaks-config file not found: $GITLEAKS_CONFIG"
+    exit 1
+fi
+
+# --replacement TEXT goes, verbatim, on the right of a filter-repo expression
+# line: `literal:<value>==><TEXT>`. filter-repo splits each line on its LAST
+# `==>`, so a TEXT containing one would split in the wrong place; a newline
+# would end the expression. Checked against the values themselves once they
+# are known (redact_select_and_confirm).
+if [[ "$REPLACEMENT_SET" == true ]]; then
+    if [[ "$MODE" != "redact" ]]; then
+        echo "Error: --replacement only applies to --redact."
+        exit 1
+    fi
+    if [[ -z "$REPLACEMENT" ]]; then
+        echo "Error: --replacement TEXT must not be empty."
+        exit 1
+    fi
+    if [[ "$REPLACEMENT" == *$'\n'* || "$REPLACEMENT" == *$'\r'* ]]; then
+        echo "Error: --replacement TEXT must be a single line."
+        exit 1
+    fi
+    if [[ "$REPLACEMENT" == *'==>'* ]]; then
+        echo "Error: --replacement TEXT must not contain '==>' (the filter-repo expression separator)."
+        exit 1
+    fi
 fi
 
 # Change to specified path if provided
@@ -332,25 +414,36 @@ gss_init_tmpdir() {
     trap 'rm -rf "$GSS_TMPDIR"' EXIT
 }
 
-# Concatenate every blob in history into one file.
+# Concatenate every object in the repository into one file -- blobs, and also
+# commits and annotated tags.
 #
 # Used twice: once to harvest candidate secrets, once after the rewrite to prove
 # each one is gone. gitleaks' own report is NOT sufficient for either job -- on
 # tes-cloud-chart it reported 79 findings where a pattern sweep of the blobs
 # found 50 distinct secrets that its rules did not all match.
-dump_history_blobs() {
-    local out="$1" idx
+#
+# Blobs alone are not enough either. A commit message or a tag annotation is
+# an object too, and pushes like any other: until 2026-09-17 a token pasted
+# into a commit message survived the rewrite while the blob-only check
+# reported it "gone from every object in history".
+#
+# --batch-all-objects also reads UNREACHABLE objects. For verification that is
+# the point -- anything still in the object database is still on disk -- and
+# the rewrite's gc prunes them, so they cannot produce a false survivor.
+dump_history_objects() {
+    local out="$1"
     gss_init_tmpdir || return 1
-    idx="$GSS_TMPDIR/blob-index"
-    git rev-list --objects --all 2>/dev/null | awk '{print $1}' \
-        | git cat-file --batch-check='%(objectname) %(objecttype)' 2>/dev/null \
-        | awk '$2 == "blob" { print $1 }' | sort -u > "$idx"
-    # One --batch pass, not a cat-file per blob: on a repo with real history the
-    # per-blob loop takes minutes where this takes a second. The interleaved
-    # "<sha> blob <size>" headers are harmless -- this file is only ever searched
-    # for literal secret values.
-    git cat-file --batch --buffer < "$idx" > "$out" 2>/dev/null || true
-    rm -f "$idx"
+    # One --batch pass, not a cat-file per object: on a repo with real history
+    # the per-object loop takes minutes where this takes a second. The
+    # interleaved "<sha> <type> <size>" headers are harmless -- this file is
+    # only ever searched for literal secret values.
+    #
+    # A failure here must not read as an empty repository: an empty dump
+    # harvests nothing, and "nothing found" is the answer that ends a scrub.
+    if ! git cat-file --batch-all-objects --batch --unordered > "$out" 2>/dev/null || [[ ! -s "$out" ]]; then
+        print_error "Could not read the repository's objects (git cat-file --batch-all-objects)."
+        return 1
+    fi
 }
 
 # Decide whether a captured string is a credential or an identifier.
@@ -358,16 +451,26 @@ dump_history_blobs() {
 # Getting this wrong in the permissive direction is not a cosmetic problem:
 # --replace-text rewrites the string EVERYWHERE in history, so redacting a short
 # or common value corrupts unrelated prose and code.
+#
+# Getting it wrong in the other direction is worse, because it is SILENT: a
+# rejected value stays in history and the run says nothing about it. So every
+# `return 1` below sets REJECT_REASON, and the caller lists each rejected value
+# with its rule. On 2026-09-17 `Password=summerholiday;` was dropped by the
+# alphabetic rule and the dry run said "No secret values found" -- exit 0.
+REJECT_REASON=""
 looks_like_secret() {
     local s="$1" classes=0
-    (( ${#s} >= MIN_SECRET_LENGTH )) || return 1
+    REJECT_REASON=""
+    if (( ${#s} < MIN_SECRET_LENGTH )); then
+        REJECT_REASON="shorter than --min-secret-length ($MIN_SECRET_LENGTH)"; return 1
+    fi
 
     # Placeholders and template expressions hold no credential.
     if [[ "$s" =~ ^(REPLACE|CHANGE|PLACEHOLDER|TODO|EXAMPLE|DUMMY|SAMPLE|CHANGEME|YOUR_|xxx|XXX) ]]; then
-        return 1
+        REJECT_REASON="placeholder"; return 1
     fi
     if [[ "$s" == '$'* || "$s" == '<'* || "$s" == 'lookup('* || "$s" == 'process.env.'* ]]; then
-        return 1
+        REJECT_REASON="variable or lookup reference"; return 1
     fi
 
     # A template expression ANYWHERE in the value, not just at the start. A Helm
@@ -375,7 +478,7 @@ looks_like_secret() {
     # quoted-value pattern and passed a start-anchored check; the literal never
     # appears in a rendered manifest, so replacing it redacts a template.
     if [[ "$s" == *'{{'* || "$s" == *'}}'* || "$s" == *'${'* ]]; then
-        return 1
+        REJECT_REASON="template expression"; return 1
     fi
 
     # Segmented identifier paths with no digits: ApiKeys_SendGridApiKeyName,
@@ -390,7 +493,7 @@ looks_like_secret() {
     # condition is what keeps real segmented tokens safe: a SendGrid key
     # (SG.<random>.<random>) is segmented too, but its segments carry digits.
     if [[ "$s" =~ ^[A-Za-z][A-Za-z0-9]*([._:]+[A-Za-z][A-Za-z0-9]*)+$ ]] && [[ ! "$s" =~ [0-9] ]]; then
-        return 1
+        REJECT_REASON="segmented identifier (a.b / a_b / a:b, no digits)"; return 1
     fi
 
     # Provider tokens are segmented too, so they must be exempted BEFORE the
@@ -402,7 +505,7 @@ looks_like_secret() {
     # Bracketed markers -- [REDACTED], [MASKED]. Output of a redaction stage, not
     # input to one.
     if [[ "$s" == \[* ]]; then
-        return 1
+        REJECT_REASON="bracketed marker"; return 1
     fi
 
     # Purely alphabetic values: accessKey, secretKey, hawkUsername. Field names,
@@ -410,7 +513,7 @@ looks_like_secret() {
     # digit or a symbol. Redacting `secretKey` rewrites the KEY of every mapping
     # that uses it.
     if [[ "$s" =~ ^[A-Za-z]+$ ]]; then
-        return 1
+        REJECT_REASON="alphabetic only (field-name shape)"; return 1
     fi
 
     # snake_case and SCREAMING_SNAKE_CASE identifiers: LOKI_S3_ACCESS_KEY_ID,
@@ -427,7 +530,7 @@ looks_like_secret() {
     # not enough here: the discriminator is that every segment is a word, and
     # the value carries no character outside [A-Za-z0-9_].
     if [[ "$s" =~ ^[A-Za-z][A-Za-z0-9]*(_[A-Za-z0-9]+)+$ ]]; then
-        return 1
+        REJECT_REASON="snake_case identifier"; return 1
     fi
 
     # kebab-case is how Kubernetes Secret names, vault entries and DNS labels are
@@ -435,7 +538,7 @@ looks_like_secret() {
     # belongs in git; the credential it names lives elsewhere. Redacting these
     # breaks configuration and conceals nothing.
     if [[ "$s" =~ ^[a-z][a-z0-9]*(-[a-z0-9]+)+$ ]]; then
-        return 1
+        REJECT_REASON="kebab-case identifier"; return 1
     fi
 
     # Character-class diversity rather than Shannon entropy: it is cheap, and it
@@ -445,7 +548,10 @@ looks_like_secret() {
     if [[ "$s" =~ [A-Z] ]]; then classes=$((classes + 1)); fi
     if [[ "$s" =~ [0-9] ]]; then classes=$((classes + 1)); fi
     if [[ "$s" =~ [^a-zA-Z0-9] ]]; then classes=$((classes + 1)); fi
-    (( classes >= 2 ))
+    if (( classes < 2 )); then
+        REJECT_REASON="fewer than 2 character classes"; return 1
+    fi
+    return 0
 }
 
 # The gate for values gitleaks itself reported.
@@ -463,12 +569,40 @@ looks_like_secret() {
 # values at all.
 looks_like_secret_minimal() {
     local s="$1"
-    (( ${#s} >= MIN_SECRET_LENGTH )) || return 1
+    REJECT_REASON=""
+    if (( ${#s} < MIN_SECRET_LENGTH )); then
+        REJECT_REASON="shorter than --min-secret-length ($MIN_SECRET_LENGTH)"; return 1
+    fi
     if [[ "$s" =~ ^(REPLACE|CHANGE|PLACEHOLDER|TODO|EXAMPLE|DUMMY|SAMPLE|CHANGEME|YOUR_) ]]; then
-        return 1
+        REJECT_REASON="placeholder"; return 1
     fi
     if [[ "$s" == *'{{'* || "$s" == *'}}'* || "$s" == *'${'* || "$s" == '$'* || "$s" == '<'* ]]; then
-        return 1
+        REJECT_REASON="template expression or variable reference"; return 1
+    fi
+    return 0
+}
+
+# The gate for the Password= field of a connection string.
+#
+# The POSITION says what the value is. After `Server=..;User Id=..;` the thing
+# in `Password=` is the password, whatever it looks like -- and people choose
+# passwords that look exactly like identifiers: `summerholiday`,
+# `my-db-pass-word`, `my_db_pass_word2`. Every one of those was thrown away by
+# the identifier rules, which exist for the opposite case: a NAME sitting
+# where a value could be.
+#
+# So this is the minimal gate plus the placeholder shapes that config
+# templating puts in exactly this position: SCREAMING_SNAKE (`FROM_VAULT`,
+# `DB_PASSWORD`), `__TOKEN__` (Azure DevOps replace-tokens), `#{Token}`
+# (Octopus), `%VAR%` (Windows env). Those are rejected -- and listed.
+looks_like_connstring_secret() {
+    local s="$1"
+    looks_like_secret_minimal "$s" || return 1
+    if [[ "$s" =~ ^[A-Z][A-Z0-9]*(_[A-Z0-9]+)+$ ]]; then
+        REJECT_REASON="SCREAMING_SNAKE placeholder"; return 1
+    fi
+    if [[ "$s" == __*__ || "$s" == '#{'* || ( "$s" == %* && "$s" == *% ) ]]; then
+        REJECT_REASON="replace-token placeholder"; return 1
     fi
     return 0
 }
@@ -479,10 +613,14 @@ looks_like_secret_minimal() {
 # tes-cloud-chart scrub they were not, and a lowercase `password=` survived the
 # rewrite -- caught only because the verification scan re-read the result.
 extract_secret_candidates() {
-    local blobs="$1" out="$2" raw trusted
+    local blobs="$1" out="$2" raw trusted connstr rejected v
     gss_init_tmpdir || return 1
     raw="$GSS_TMPDIR/candidates.raw"
     trusted="$GSS_TMPDIR/candidates.trusted"
+    connstr="$GSS_TMPDIR/candidates.connstr"
+    rejected="$GSS_TMPDIR/candidates.rejected-raw"
+    REJECTED_FILE="$GSS_TMPDIR/candidates.rejected"
+    SECRETS_FROM_ABSENT=0
 
     # Values gitleaks reported, under whatever config is in force, plus anything
     # the operator named explicitly. Kept separate from the sweep because these
@@ -493,9 +631,27 @@ extract_secret_candidates() {
     # only overrides it. `LOKI_S3_ACCESS_KEY_ID` passed to --secrets-from was
     # silently dropped by the snake_case filter, which is the one case where the
     # user had been explicit.
+    #
+    # Each line is trimmed (a list saved on Windows ends every value in \r,
+    # which then matches nothing), and a value that occurs nowhere in the
+    # repository is dropped with a count rather than proposed. One shared list
+    # is meant to serve many repositories; a value absent from this one has
+    # nothing to redact here, and keeping it would fail the verification
+    # control below, which requires every value to be present before the
+    # rewrite.
     : > "$trusted"
-    if [[ -n "$SECRETS_FROM" && -f "$SECRETS_FROM" ]]; then
-        grep -vE '^[[:space:]]*(#|$)' "$SECRETS_FROM" >> "$trusted" || true
+    if [[ -n "$SECRETS_FROM" ]]; then
+        while IFS= read -r v || [[ -n "$v" ]]; do
+            v="${v%$'\r'}"
+            v="${v#"${v%%[![:space:]]*}"}"
+            v="${v%"${v##*[![:space:]]}"}"
+            [[ -z "$v" || "$v" == \#* ]] && continue
+            if grep -aqF -- "$v" "$blobs" 2>/dev/null; then
+                printf '%s\n' "$v" >> "$trusted"
+            else
+                SECRETS_FROM_ABSENT=$((SECRETS_FROM_ABSENT + 1))
+            fi
+        done < "$SECRETS_FROM"
     fi
     if [[ -n "${GITLEAKS_OUTPUT:-}" && "$GITLEAKS_OUTPUT" != "[]" && "$GITLEAKS_OUTPUT" != "null" ]]; then
         printf '%s' "$GITLEAKS_OUTPUT" | "$PYTHON_CMD" -c '
@@ -537,24 +693,70 @@ except Exception:
 
     } > "$raw" 2>/dev/null || true
 
+    # The Password= field of a CONNECTION STRING: a `;`-delimited run of
+    # key=value pairs that also names a server, a user or a database. Judged
+    # by looks_like_connstring_secret, not the identifier rules -- see there.
+    #
+    # The context is what licenses that. A bare `password=x` is as often code
+    # (`password=password`, `password=getPassword()`) as configuration, and a
+    # rule that redacted every such value would rewrite source everywhere. So
+    # the neighbouring key is required, with no whitespace around `=`, which
+    # is how connection strings are written and assignments mostly are not.
+    local ck nq
+    ck='(server|data source|datasource|host|hostname|address|addr|network address|user id|userid|uid|user|username|database|initial catalog)'
+    nq='[^;"'"'"'<>=]'
+    {
+        # Password after a server/user/database key: take the text after the
+        # LAST `;`, then drop the `Password=` key.
+        grep -aoiE '(^|[^[:alnum:]_])'"$ck"'='"$nq"'*;('"$nq"'*=[^;"'"'"'<>]*;)*[[:space:]]*(password|pwd)=[^;"'"'"'[:space:]]+' "$blobs" 2>/dev/null \
+            | sed -E 's/^.*;//; s/^[[:space:]]*[A-Za-z]+=//' || true
+        # Password first, a server/user/database key after it.
+        grep -aoiE '(^|[^[:alnum:]_])(password|pwd)=[^;"'"'"'[:space:]]+;('"$nq"'*=[^;"'"'"'<>]*;)*[[:space:]]*'"$ck"'=' "$blobs" 2>/dev/null \
+            | sed -E 's/^[^A-Za-z]?[A-Za-z]+=//; s/;.*$//' || true
+    } > "$connstr" 2>/dev/null || true
+
     : > "$out"
+    : > "$rejected"
     local line
-    # Scanner findings: minimal gate only.
+    # Scanner findings and operator values: minimal gate only.
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
         if looks_like_secret_minimal "$line"; then
-            printf '%s\n' "$line"
+            printf '%s\n' "$line" >> "$out"
+        else
+            printf '%s\t%s\n' "$REJECT_REASON" "$line" >> "$rejected"
         fi
-    done < <(sort -u "$trusted") >> "$out"
+    done < <(sort -u "$trusted")
+    # Connection-string passwords: minimal gate plus template placeholders.
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        if looks_like_connstring_secret "$line"; then
+            printf '%s\n' "$line" >> "$out"
+        else
+            printf '%s\t%s\n' "$REJECT_REASON" "$line" >> "$rejected"
+        fi
+    done < <(sort -u "$connstr")
     # Sweep findings: full heuristics, because nothing has vetted these.
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
         if looks_like_secret "$line"; then
-            printf '%s\n' "$line"
+            printf '%s\n' "$line" >> "$out"
+        else
+            printf '%s\t%s\n' "$REJECT_REASON" "$line" >> "$rejected"
         fi
-    done < <(sort -u "$raw") >> "$out"
-    # De-duplicate across the two sources before ordering.
+    done < <(sort -u "$raw")
+    # De-duplicate across the sources before ordering.
     sort -u "$out" -o "$out"
+
+    # A value one gate rejected and another accepted IS being redacted, so it
+    # is not a rejection. What is left was dropped by every gate that saw it:
+    # one line per value, first reason wins. FILENAME, not NR == FNR: with no
+    # accepted values the first file is empty, NR == FNR then holds for the
+    # second file too, and every rejection read as accepted -- an empty list.
+    awk -F'\t' 'FILENAME == ARGV[1] { acc[$0] = 1; next }
+        { v = substr($0, index($0, "\t") + 1) }
+        !(v in acc) && !(v in seen) { seen[v] = 1; print }' "$out" "$rejected" \
+        | sort -t $'\t' -k1,1 -s > "$REJECTED_FILE"
 
     # Longest first. --replace-text applies the rules in file order, so a secret
     # that is a prefix of a longer one must be replaced second or it truncates
@@ -597,8 +799,13 @@ check_stale_worktrees() {
         print_info "Remove them first:  git worktree remove <path>"
         print_info "Or prune abandoned ones:  git worktree prune"
         echo ""
+        if [[ "$DRY_RUN" == true ]]; then
+            return 0
+        fi
         if [[ "$FORCE" != true ]]; then
-            read -p "Type 'IGNORE' to rewrite anyway (not recommended): " WT_CONFIRM
+            # --yes does not answer this: it confirms the rewrite, not the
+            # override of a guard. With stdin closed the read fails and aborts.
+            read -r -p "Type 'IGNORE' to rewrite anyway (not recommended): " WT_CONFIRM || WT_CONFIRM=""
             if [[ "$WT_CONFIRM" != "IGNORE" ]]; then
                 print_info "Aborted. Remove the worktrees and re-run."
                 exit 1
@@ -607,23 +814,127 @@ check_stale_worktrees() {
     fi
 }
 
+# Refuse to rewrite while the repository has stash entries.
+#
+# A stash is a pair of commits hanging off refs/stash, and its older entries
+# exist ONLY in that ref's reflog. Whether they survive a rewrite depends on
+# the filter-repo version: recent ones rewrite the stash, older ones leave it
+# pointing at pre-rewrite commits -- which keeps every secret in them alive in
+# this repository after a run that reports success. And a stash is uncommitted
+# work: a history rewrite is no place to find out what happens to it.
+#
+# This script used to advise stashing uncommitted changes before a run. That
+# advice created the problem.
+check_stash() {
+    local count
+    count=$(git stash list 2>/dev/null | wc -l | tr -d ' ')
+    [[ -z "$count" ]] && count=0
+    if (( count > 0 )); then
+        echo ""
+        if [[ "$DRY_RUN" == true ]]; then
+            print_warning "This repository has $count stash entr(y/ies). A real run will refuse"
+            print_warning "until they are gone."
+            echo ""
+            return 0
+        fi
+        print_error "This repository has $count stash entr(y/ies):"
+        git stash list 2>/dev/null | sed 's/^/    /'
+        echo ""
+        print_warning "Stash entries are commits kept outside every branch. A history"
+        print_warning "rewrite may leave them holding the pre-rewrite content -- and the"
+        print_warning "secrets in it -- and it is no place to keep work in progress."
+        echo ""
+        print_info "Save each one somewhere safe, then clear them:"
+        print_info "  git stash show -p stash@{0} > stash-0.patch   (one per entry)"
+        print_info "  git stash clear"
+        print_info "Nothing was changed."
+        exit 1
+    fi
+}
+
+# Warn about .gitleaksignore: its entries do not survive a rewrite.
+#
+# Each line is a fingerprint `<commit>:<file>:<rule>:<line>`, and the commit is
+# a SHA the rewrite replaces. After the run every entry points at a commit that
+# no longer exists, so each finding it suppressed comes back -- or the file is
+# regenerated from a fresh scan and suppresses whatever is there now, without
+# anyone deciding that it should.
+warn_gitleaksignore() {
+    [[ -f ".gitleaksignore" ]] || return 0
+    local n
+    n=$(grep -cvE '^[[:space:]]*(#|$)' .gitleaksignore 2>/dev/null || true)
+    echo ""
+    print_warning "This repository has a .gitleaksignore (${n:-0} fingerprint(s))."
+    print_warning "Each fingerprint contains a commit SHA, and this rewrite changes every"
+    print_warning "SHA: all of them stop matching after the run."
+    print_info "Move each one to a .gitleaks.toml allowlist that says WHY it is allowed:"
+    echo -e "  ${GRAY}[[allowlists]]${NC}"
+    echo -e "  ${GRAY}description = \"<reason this value is not a secret>\"${NC}"
+    echo -e "  ${GRAY}regexTarget = \"secret\"${NC}"
+    echo -e "  ${GRAY}regexes = ['''^<the value>$''']${NC}"
+    echo ""
+}
+
 # Build the list, show it, and confirm. Replaces file selection in --redact mode.
 SECRETS_FILE=""
 PRE_BLOBS=""
 REPLACEMENTS_FILE=""
+REJECTED_FILE=""
+SECRETS_FROM_ABSENT=0
+# Values left out because they are live in HEAD. Non-zero means the repository
+# still holds them after the run, and the run exits 3 -- see the end.
+HEAD_SKIPPED=0
 redact_select_and_confirm() {
     print_header "Step 5: Collecting secret values to redact"
 
     gss_init_tmpdir
-    PRE_BLOBS="$GSS_TMPDIR/blobs-before"
+    PRE_BLOBS="$GSS_TMPDIR/objects-before"
     SECRETS_FILE="$GSS_TMPDIR/secrets"
     REPLACEMENTS_FILE="$GSS_TMPDIR/replacements.txt"
 
-    print_info "Reading every blob in history..."
-    dump_history_blobs "$PRE_BLOBS"
+    # The patterns and gitleaks find credential SHAPES. A value that does not
+    # have one -- or has the shape of an identifier -- is found only if you
+    # name it. Not mandatory, because a quick scrub of one obvious token
+    # should not need a file; but a production scrub without it is relying
+    # on guesswork, and it should say so where it cannot be missed.
+    if [[ -z "$SECRETS_FROM" ]]; then
+        print_error "╔══════════════════════════════════════════════════════════════════╗"
+        print_error "║  No --secrets-from list: only values that the patterns and       ║"
+        print_error "║  gitleaks recognise will be redacted. A password shaped like a   ║"
+        print_error "║  word or an identifier can be rejected -- check the REJECTED     ║"
+        print_error "║  list below, and name known values in a --secrets-from file.     ║"
+        print_error "╚══════════════════════════════════════════════════════════════════╝"
+        echo ""
+    fi
+
+    print_info "Reading every object in the repository (blobs, commits, tags)..."
+    dump_history_objects "$PRE_BLOBS" || exit 1
     print_info "Scanned $(wc -c < "$PRE_BLOBS" | tr -d ' ') bytes of history"
 
     extract_secret_candidates "$PRE_BLOBS" "$SECRETS_FILE"
+
+    if (( SECRETS_FROM_ABSENT > 0 )); then
+        print_info "$SECRETS_FROM_ABSENT value(s) from --secrets-from occur nowhere in this"
+        print_info "repository -- nothing to redact for them here."
+    fi
+
+    # Every candidate that a gate dropped, with the gate. This list is the only
+    # thing standing between an identifier-shaped password and a report that
+    # says the repository is clean.
+    local rej_n
+    rej_n=$(wc -l < "$REJECTED_FILE" | tr -d ' ')
+    if (( rej_n > 0 )); then
+        echo ""
+        print_warning "$rej_n candidate value(s) were REJECTED and will NOT be redacted:"
+        echo ""
+        local reason val
+        while IFS=$'\t' read -r reason val; do
+            echo -e "  ${GRAY}$(mask_secret "$val")${NC}  ${YELLOW}rejected: $reason${NC}"
+        done < "$REJECTED_FILE"
+        echo ""
+        print_info "If any of these IS a credential, put it in a --secrets-from file (one"
+        print_info "value per line) and re-run: named values skip the identifier rules."
+    fi
 
     # Split off anything still present in the CURRENT checkout.
     #
@@ -676,7 +987,9 @@ redact_select_and_confirm() {
             print_info "credential that is still live needs rotating and moving out of the"
             print_info "file, which a history rewrite does not do."
             print_info "Deal with them, then re-run. Use --include-head-values to override."
+            print_error "This run will exit 3: the repository still holds these values."
             cp "$hist_file" "$SECRETS_FILE"
+            HEAD_SKIPPED=$live_n
         fi
     fi
 
@@ -684,8 +997,31 @@ redact_select_and_confirm() {
     n=$(wc -l < "$SECRETS_FILE" | tr -d ' ')
 
     if (( n == 0 )); then
+        # "Nothing to rewrite" and "clean" are different answers. Values that
+        # were skipped because they are live in HEAD are still in the
+        # repository, and a caller looping over repositories reads the status.
+        if (( HEAD_SKIPPED > 0 )); then
+            print_error "Nothing left to rewrite, but $HEAD_SKIPPED value(s) live in HEAD were skipped."
+            exit 3
+        fi
         print_success "No secret values found to redact."
         exit 0
+    fi
+
+    # The replacement must not reproduce what it replaces. If TEXT contains a
+    # value, that value is written straight back into every commit; if a value
+    # contains TEXT, the two are too alike to tell apart afterwards -- in the
+    # verification, in a scan, or by eye.
+    if [[ "$REPLACEMENT_SET" == true ]]; then
+        local v
+        while IFS= read -r v; do
+            if [[ "$REPLACEMENT" == *"$v"* || "$v" == *"$REPLACEMENT"* ]]; then
+                print_error "--replacement TEXT contains a value being replaced, or is contained in one:"
+                echo -e "  ${GRAY}$(mask_secret "$v")${NC}"
+                print_info "Choose a TEXT that shares nothing with the values. Nothing was changed."
+                exit 1
+            fi
+        done < "$SECRETS_FILE"
     fi
 
     echo ""
@@ -711,30 +1047,61 @@ redact_select_and_confirm() {
     i=0
     while IFS= read -r line; do
         i=$((i + 1))
-        printf 'literal:%s==>REPLACE_WITH_SECRET_%02d\n' "$line" "$i" >> "$REPLACEMENTS_FILE"
+        if [[ "$REPLACEMENT_SET" == true ]]; then
+            printf 'literal:%s==>%s\n' "$line" "$REPLACEMENT" >> "$REPLACEMENTS_FILE"
+        else
+            printf 'literal:%s==>REPLACE_WITH_SECRET_%02d\n' "$line" "$i" >> "$REPLACEMENTS_FILE"
+        fi
     done < "$SECRETS_FILE"
 
     if [[ "$DRY_RUN" == true ]]; then
         echo ""
         print_success "DRY RUN MODE - No changes will be made"
-        print_info "Would replace the $n value(s) above with REPLACE_WITH_SECRET_NN."
+        print_info "Would replace the $n value(s) above with $(placeholder_label)."
+        if (( HEAD_SKIPPED > 0 )); then
+            print_error "Exiting 3: $HEAD_SKIPPED value(s) live in HEAD would be skipped."
+            exit 3
+        fi
         exit 0
     fi
 }
 
-# Count gitleaks findings that are NOT the placeholders this tool introduced.
+# What the values become, for messages.
+placeholder_label() {
+    if [[ "$REPLACEMENT_SET" == true ]]; then
+        printf '%s' "$REPLACEMENT"
+    else
+        printf 'REPLACE_WITH_SECRET_NN'
+    fi
+}
+
+# Count gitleaks findings that are NOT the placeholders this tool introduced --
+# REPLACE_WITH_SECRET_NN, or exactly the --replacement TEXT when one was given.
 # Returns -1 on unparseable output so the caller takes the loud branch rather
 # than reading a parse failure as a clean repository.
 count_real_findings() {
-    printf '%s' "$1" | "$PYTHON_CMD" -c '
-import sys, json, re
+    local custom=""
+    [[ "$REPLACEMENT_SET" == true ]] && custom="$REPLACEMENT"
+    printf '%s' "$1" | GSS_REPLACEMENT="$custom" "$PYTHON_CMD" -c '
+import sys, json, re, os
 try:
     data = json.load(sys.stdin) or []
 except Exception:
     print("-1"); raise SystemExit(0)
-pat = re.compile(r"^REPLACE_WITH_SECRET_[0-9]+$")
+custom = os.environ.get("GSS_REPLACEMENT", "")
+pat = re.compile("^" + re.escape(custom) + "$" if custom else r"^REPLACE_WITH_SECRET_[0-9]+$")
 print(sum(1 for f in data if not pat.match((f.get("Secret") or "").strip())))
 ' 2>/dev/null || printf '%s' "-1"
+}
+
+# The gitleaks allowlist regex for the placeholder, as it goes in a TOML
+# literal string.
+placeholder_regex() {
+    if [[ "$REPLACEMENT_SET" == true ]]; then
+        printf '%s' "$REPLACEMENT" | "$PYTHON_CMD" -c 'import re, sys; sys.stdout.write("^" + re.escape(sys.stdin.read()) + "$")'
+    else
+        printf '%s' '^REPLACE_WITH_SECRET_[0-9]+$'
+    fi
 }
 
 # Prove the rewrite worked -- and prove the proof can fail.
@@ -747,8 +1114,8 @@ print(sum(1 for f in data if not pat.match((f.get("Secret") or "").strip())))
 verify_redaction() {
     local post survivors=0 checked=0 found_before=0 line
     gss_init_tmpdir
-    post="$GSS_TMPDIR/blobs-after"
-    dump_history_blobs "$post"
+    post="$GSS_TMPDIR/objects-after"
+    dump_history_objects "$post" || return 1
 
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
@@ -776,11 +1143,12 @@ verify_redaction() {
 
     if (( survivors > 0 )); then
         print_error "✗ $survivors of $checked value(s) SURVIVED the rewrite."
-        print_info "  Restore from the backup branch and re-run."
+        print_info "  Do not push. Restore from the mirror clone you took before the run,"
+        print_info "  find out what holds them, and re-run."
         return 1
     fi
 
-    print_success "✓ All $checked value(s) are gone from every object in history."
+    print_success "✓ All $checked value(s) are gone from every object -- blobs, commits and tags."
     return 0
 }
 
@@ -804,6 +1172,13 @@ fi
 CURRENT_BRANCH=$(git branch --show-current)
 print_info "Current branch: $CURRENT_BRANCH"
 echo ""
+
+# Guards run FIRST, before any prompt or scan. The worktree guard used to run
+# after the "Type YES" confirmation: an operator confirmed a rewrite and was
+# only then told it could not be done safely.
+check_stash
+check_stale_worktrees
+warn_gitleaksignore
 
 # ============================================================================
 # Detection Method Selection (if not specified via command line)
@@ -930,13 +1305,15 @@ if [[ -n "$(git status --porcelain)" ]]; then
             echo -e "  ${YELLOW}- $FILE${NC}"
         done
         echo ""
-        print_info "It's recommended to commit or stash these changes before cleaning git history."
+        # Not "or stash": a stash is refused outright (check_stash), so that
+        # advice sent people straight into the next guard.
+        print_info "Commit these changes, or move them out of the repository, before rewriting history."
         echo ""
         
         if [[ "$FORCE" == false ]]; then
-            read -p "Do you want to proceed anyway? (yes/no) [default: no]: " PROCEED
+            read -r -p "Do you want to proceed anyway? (yes/no) [default: no]: " PROCEED || PROCEED=""
             if [[ -z "$PROCEED" ]] || ([[ "$PROCEED" != "yes" ]] && [[ "$PROCEED" != "y" ]]); then
-                print_info "Aborted. Please commit or stash your changes first, or use --force flag to skip this prompt."
+                print_info "Aborted. Commit your changes first, or use --force to skip this prompt."
                 exit 0
             else
                 print_warning "Proceeding with uncommitted changes in other files..."
@@ -1422,7 +1799,11 @@ except Exception as e:
         fi
     fi
     
-    if [[ ${#DETECTED_FILES[@]} -eq 0 ]]; then
+    # "No secrets detected" is a claim about a scan that RAN. After a failed
+    # one it used to print anyway, directly under the failure.
+    if [[ "$GITLEAKS_EXIT" -ne 0 && "$GITLEAKS_EXIT" -ne 1 ]]; then
+        print_warning "gitleaks produced no usable result -- nothing is known from it."
+    elif [[ ${#DETECTED_FILES[@]} -eq 0 ]]; then
         print_success "No secrets detected by gitleaks!"
         echo ""
         print_info "This could mean:"
@@ -1586,7 +1967,15 @@ echo -e "${GREEN}  [A] All files${NC}"
 echo -e "${RED}  [N] None (cancel)${NC}"
 echo ""
 
-read -p "Enter file numbers (comma-separated) or 'A' for all, 'N' to cancel: " SELECTION
+# --yes selects every file only when the operator LISTED them (--files,
+# --files-from): that list is already a decision. Files a scan proposed are
+# still chosen by a person.
+if [[ "$ASSUME_YES" == true && ( -n "$MANUAL_FILES" || -n "$FILES_FROM" ) ]]; then
+    SELECTION="A"
+    print_info "--yes: selecting every listed file"
+else
+    read -r -p "Enter file numbers (comma-separated) or 'A' for all, 'N' to cancel: " SELECTION || SELECTION="N"
+fi
 
 if [[ "$SELECTION" == "N" ]] || [[ "$SELECTION" == "n" ]]; then
     print_info "Cancelled by user."
@@ -1652,10 +2041,22 @@ print_error "⚠️  All commit SHAs will change!"
 print_error "⚠️  You will need to force push!"
 print_error "⚠️  All team members must re-clone the repository!"
 echo ""
-read -p "Type 'YES' to continue: " CONFIRM
-if [[ "$CONFIRM" != "YES" ]]; then
-    print_info "Aborted."
-    exit 0
+# There is no backup branch. There used to be one, created in this repository
+# just before the rewrite -- and filter-repo rewrites EVERY ref, so the
+# "backup" came out redacted along with everything else. It backed up nothing,
+# and the restore instructions pointed at it.
+print_warning "BACKUP: this tool does not make one. Take it BEFORE confirming, outside"
+print_warning "this repository -- a mirror clone keeps every ref:"
+print_info "  git clone --mirror \"$(pwd)\" \"$(pwd).mirror-backup.git\""
+echo ""
+if [[ "$ASSUME_YES" == true ]]; then
+    print_warning "--yes given: proceeding without the confirmation prompt."
+else
+    read -r -p "Type 'YES' to continue: " CONFIRM || CONFIRM=""
+    if [[ "$CONFIRM" != "YES" ]]; then
+        print_info "Aborted."
+        exit 0
+    fi
 fi
 
 # Save remote information (git-filter-repo removes remotes)
@@ -1677,32 +2078,24 @@ while IFS= read -r remote; do
     fi
 done < <(git remote)
 
-# A linked worktree keeps the pre-rewrite objects reachable, so check before
-# rewriting rather than discovering it in verification.
-check_stale_worktrees
-
-# Create backup branch
-echo ""
-print_header "Step 8: Creating backup branch..."
-BACKUP_BRANCH="backup-before-secret-cleanup-$(date +%Y%m%d-%H%M%S)"
-git branch "$BACKUP_BRANCH"
-print_success "Backup branch created: $BACKUP_BRANCH"
-
 # Remove files from history
 echo ""
 if [[ "$MODE" == "redact" ]]; then
-    print_header "Step 9: Redacting secret values in git history..."
+    print_header "Step 8: Redacting secret values in git history..."
 else
-    print_header "Step 9: Removing files from git history..."
+    print_header "Step 8: Removing files from git history..."
 fi
 print_info "This may take a while..."
 
 # Build git-filter-repo command
 if [[ "$MODE" == "redact" ]]; then
-    FILTER_REPO_ARGS=("--replace-text" "$REPLACEMENTS_FILE" "--force")
+    # --replace-message with the SAME expressions: --replace-text reaches file
+    # contents only, and a value pasted into a commit message or a tag
+    # annotation is pushed like any other object.
+    FILTER_REPO_ARGS=("--replace-text" "$REPLACEMENTS_FILE" "--replace-message" "$REPLACEMENTS_FILE" "--force")
     # Deliberately not echoed with its argument expanded: the replacements file
     # is a plaintext list of every credential in the repository.
-    print_info "Running: git filter-repo --replace-text <replacements> --force"
+    print_info "Running: git filter-repo --replace-text <replacements> --replace-message <replacements> --force"
 else
     FILTER_REPO_ARGS=("--invert-paths" "--force")
     for file_entry in "${SELECTED_FILES[@]}"; do
@@ -1718,27 +2111,47 @@ if [[ "$USE_SYSTEM_FILTER_REPO" == true ]]; then
     if ! "$FILTER_REPO_CMD" "${FILTER_REPO_ARGS[@]}"; then
         echo ""
         print_error "ERROR: git-filter-repo failed!"
-        print_warning "You can restore from backup branch: $BACKUP_BRANCH"
+        print_warning "Do not push. Restore from the mirror clone you took before the run."
         exit 1
     fi
 else
     if ! "$VENV_PYTHON" -m git_filter_repo "${FILTER_REPO_ARGS[@]}"; then
         echo ""
         print_error "ERROR: git-filter-repo failed!"
-        print_warning "You can restore from backup branch: $BACKUP_BRANCH"
+        print_warning "Do not push. Restore from the mirror clone you took before the run."
         exit 1
+    fi
+fi
+
+# Keep the commit-map where it survives.
+#
+# .git/filter-repo/commit-map is the old-SHA -> new-SHA table, and it is the
+# file GitLab's Repository cleanup asks for. The next filter-repo run in this
+# repository overwrites it, and deleting the clone deletes it. A copy beside
+# the repository outlives both.
+COMMIT_MAP_SRC="$(git rev-parse --absolute-git-dir)/filter-repo/commit-map"
+COMMIT_MAP_COPY=""
+if [[ -s "$COMMIT_MAP_SRC" ]]; then
+    REPO_ABS=$(pwd -P)
+    COMMIT_MAP_COPY="$(dirname "$REPO_ABS")/$(basename "$REPO_ABS").commit-map"
+    if [[ -e "$COMMIT_MAP_COPY" ]]; then
+        COMMIT_MAP_COPY="$(dirname "$REPO_ABS")/$(basename "$REPO_ABS").$(date +%Y%m%d-%H%M%S).commit-map"
+    fi
+    if ! cp "$COMMIT_MAP_SRC" "$COMMIT_MAP_COPY"; then
+        print_warning "Could not copy the commit-map to $COMMIT_MAP_COPY -- keep $COMMIT_MAP_SRC yourself."
+        COMMIT_MAP_COPY=""
     fi
 fi
 
 # Clean up
 echo ""
-print_header "Step 10: Cleaning up git references..."
+print_header "Step 9: Cleaning up git references..."
 git reflog expire --expire=now --all
 git gc --prune=now --aggressive
 
 # Restore remotes (git-filter-repo removes them)
 echo ""
-print_header "Step 11: Restoring remote configuration..."
+print_header "Step 10: Restoring remote configuration..."
 for remote in "${!REMOTE_INFO[@]}"; do
     REMOTE_URL="${REMOTE_INFO[$remote]}"
     if git remote add "$remote" "$REMOTE_URL" 2>/dev/null; then
@@ -1761,7 +2174,7 @@ print_success "========================================"
 echo ""
 
 # ============================================================================
-# Step 12: Verify with gitleaks
+# Step 11: Verify with gitleaks
 # ============================================================================
 # Gated on whether gitleaks is actually available, not on SKIP_GITLEAKS. That flag also
 # gets set by --files and --files-from, which say nothing about wanting the result left
@@ -1773,7 +2186,7 @@ echo ""
 REDACT_VERIFY_RC=0
 if [[ "$MODE" == "redact" ]]; then
     echo ""
-    print_header "Step 12a: Verifying redaction directly..."
+    print_header "Step 11a: Verifying redaction directly..."
     set +e
     verify_redaction
     REDACT_VERIFY_RC=$?
@@ -1783,7 +2196,7 @@ fi
 
 if [[ -n "$GITLEAKS_PATH" ]]; then
     echo ""
-    print_header "Step 12: Verifying cleanup with gitleaks..."
+    print_header "Step 11: Verifying cleanup with gitleaks..."
     print_info "Running gitleaks scan to verify secrets are removed..."
     echo ""
 
@@ -1807,19 +2220,20 @@ if [[ -n "$GITLEAKS_PATH" ]]; then
     elif [[ "$VERIFY_EXIT" -eq 0 ]] || [[ "$VERIFY_OUTPUT" == "[]" ]]; then
         print_success "✓ No secrets detected by gitleaks!"
     elif [[ "$MODE" == "redact" ]] && [[ "$(count_real_findings "$VERIFY_OUTPUT")" == "0" ]]; then
-        # Every remaining finding is a REPLACE_WITH_SECRET_NN placeholder.
+        # Every remaining finding is a placeholder: REPLACE_WITH_SECRET_NN, or
+        # the --replacement TEXT.
         # generic-api-key fires on `Password=<anything>` whatever the value is, so
         # a successful redaction leaves a repo that scans dirty forever. Calling
         # that "secrets still detected" trains the operator to ignore the scanner,
         # which is worse than the noise itself.
         print_success "✓ No secrets detected by gitleaks!"
         echo ""
-        print_info "gitleaks matched only the REPLACE_WITH_SECRET_NN placeholders."
+        print_info "gitleaks matched only the $(placeholder_label) placeholders."
         print_info "Allowlist them so future scans stay meaningful -- in .gitleaks.toml:"
         echo ""
         echo -e "  ${GRAY}[[allowlists]]${NC}"
         echo -e "  ${GRAY}description = \"Redaction placeholders left by git-secret-scrubber\"${NC}"
-        echo -e "  ${GRAY}regexes = ['''^REPLACE_WITH_SECRET_[0-9]+$''']${NC}"
+        echo -e "  ${GRAY}regexes = ['''$(placeholder_regex)''']${NC}"
         echo -e "  ${GRAY}regexTarget = \"secret\"${NC}"
     else
         print_warning "gitleaks still detected some secrets!"
@@ -1874,8 +2288,33 @@ else
 fi
 
 echo ""
-print_info "Backup branch: $BACKUP_BRANCH"
+
+# GitLab keeps the old commits after the force-push. None of this is done by
+# the push, and none of it can be done from here.
+print_header "Commit-map and GitLab follow-up"
+if [[ -n "$COMMIT_MAP_COPY" ]]; then
+    print_success "commit-map (old SHA -> new SHA) copied to:"
+    echo -e "   ${CYAN}$COMMIT_MAP_COPY${NC}"
+    print_info "  (original: $COMMIT_MAP_SRC -- overwritten by the next filter-repo run)"
+else
+    print_warning "No commit-map found at $COMMIT_MAP_SRC."
+fi
 echo ""
+print_info "On GitLab the force-push does NOT remove the old commits:"
+print_info "  - refs/merge-requests/* are read-only. Every merge request keeps its old"
+print_info "    head commit and its stored diff, whatever you push. An MR whose diff"
+print_info "    shows a secret must be deleted (not just closed) to lose it."
+print_info "  - refs/keep-around/* pin commits that pipelines, notes and MR diffs"
+print_info "    point at. Only Repository cleanup removes them."
+print_info "  - After the push, wait 30 minutes (cleanup skips newer objects), then:"
+print_info "    Settings → Repository → Repository maintenance → Repository cleanup"
+print_info "    (older GitLab: Settings → Repository → Repository cleanup)"
+print_info "    and upload the commit-map above."
+echo ""
+if [[ -f ".gitleaksignore" ]]; then
+    print_warning "Reminder: every .gitleaksignore fingerprint is now dead (they carry old SHAs)."
+    echo ""
+fi
 
 print_error "╔══════════════════════════════════════════════════════════════════╗"
 print_error "║  ⚠️  REMINDER: After force-push, ALL teammates must RE-CLONE!     ║"
@@ -1883,7 +2322,7 @@ print_error "║  Their local copies will be incompatible with the new history. 
 print_error "╚══════════════════════════════════════════════════════════════════╝"
 echo ""
 if [[ "$MODE" == "redact" ]]; then
-    print_info "Redacted values now read REPLACE_WITH_SECRET_NN. Allowlist that string"
+    print_info "Redacted values now read $(placeholder_label). Allowlist that string"
     print_info "in your gitleaks config, or every historical commit fails future scans."
     echo ""
 fi
@@ -1893,5 +2332,12 @@ fi
 if [[ "$MODE" == "redact" && "$REDACT_VERIFY_RC" -ne 0 ]]; then
     print_error "Exiting non-zero: redaction could not be verified."
     exit 1
+fi
+# Nor may a scrub that knowingly left values behind. The history-only values
+# are gone, but the ones live in HEAD were skipped by design and are still in
+# every commit that has them.
+if [[ "$MODE" == "redact" && "$HEAD_SKIPPED" -gt 0 ]]; then
+    print_error "Exiting 3: $HEAD_SKIPPED value(s) live in HEAD were skipped and are still in history."
+    exit 3
 fi
 

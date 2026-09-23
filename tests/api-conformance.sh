@@ -14,8 +14,7 @@
 #
 # API conformance harness for Git-Secret-Scrubber.
 # Every option gets a fixture, a run, and a concrete assertion.
-TOOL_SH="$(cd "$(dirname "$0")/.." && pwd)/clean-secrets.sh"
-TOOL_PS="$(cd "$(dirname "$0")/.." && pwd)/clean-secrets.ps1"
+TOOL_SH="${TOOL_SH:-$(cd "$(dirname "$0")/.." && pwd)/clean-secrets.sh}"
 W="$1/apitest"; rm -rf "$W"; mkdir -p "$W"
 PASS=0; FAIL=0
 res(){ if [ "$1" = ok ]; then PASS=$((PASS+1)); printf '  \033[32mPASS\033[0m  %-34s %s\n' "$2" "$3"; else FAIL=$((FAIL+1)); printf '  \033[31mFAIL\033[0m  %-34s %s\n' "$2" "$3"; fi; }
@@ -116,7 +115,9 @@ git -C "$d" log --all --oneline -- .env 2>/dev/null | grep -q . && res no "--fil
 
 # 15 --dry-run in delete mode
 d=$(mkfix_file r13); before=$(git -C "$d" rev-parse HEAD)
-( cd "$d" && "$TOOL_SH" --delete-files --files ".env" --dry-run >/dev/null 2>&1 )
+# stdin closed: a delete-mode dry run still asks which files, and an inherited
+# stdin that never closes hangs the suite there.
+( cd "$d" && "$TOOL_SH" --delete-files --files ".env" --dry-run </dev/null >/dev/null 2>&1 )
 [ "$(git -C "$d" rev-parse HEAD)" = "$before" ] && res ok "--delete-files --dry-run" "history unchanged" || res no "--delete-files --dry-run" "history CHANGED"
 
 # 16 --skip-gitleaks
@@ -150,3 +151,5 @@ o=$( cd "$d" && "$TOOL_SH" --redact --dry-run 2>&1 ); rc=$?
 echo
 echo "bash: $PASS passed, $FAIL failed"
 echo "BASHRESULT $PASS $FAIL"
+# CI reads the status, not the summary line.
+[ "$FAIL" -eq 0 ]
