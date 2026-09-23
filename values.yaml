@@ -1,2 +1,2 @@
 db: "Server=pg;User Id=a;Password=Kp9mX2#vT7wQ4nL;Database=a;"
-x: 1
+keep: LOKI_S3_ACCESS_KEY_ID
