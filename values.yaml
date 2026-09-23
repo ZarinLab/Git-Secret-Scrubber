@@ -1,2 +1,1 @@
-db: "Server=pg;User Id=a;Password=FROM_VAULT;Database=a;"
-keep: LOKI_S3_ACCESS_KEY_ID
+db: "Server=pg;User Id=a;Password=Kp9mX2#vT7wQ4nL;Database=a;"
