@@ -13,6 +13,16 @@ regression block of `tests/api-conformance-ps.sh` (PowerShell) that fails
 against f27e18a and passes now.
 
 ### Added
+- **`--exclude-from FILE`** (bash): literal values NEVER to redact, one per
+  line — code expressions, UI words, placeholders a person vetted. They are
+  listed among the rejects with the reason. Used on the 2026-09-23 estate
+  rewrite, where the dry runs proposed `DateTime.Now.AddDays(...)`, locale
+  strings and `postgres`; the scrubber replaces a value everywhere, so one
+  word in the list corrupts every file that contains it.
+- **`--candidates-out FILE`** (bash): the exact values that will be replaced,
+  written mode 600, for vetting before `--yes`.
+- The `password=` sweep rejects a value containing a space — UI text, not a
+  credential.
 - **`--replacement TEXT` / `-Replacement TEXT`** (`--redact` only): every value
   becomes TEXT instead of a numbered `REPLACE_WITH_SECRET_NN`. TEXT must be
   non-empty, one line, free of `==>` (filter-repo's separator), and share nothing

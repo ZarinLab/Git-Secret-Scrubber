@@ -92,6 +92,8 @@ MANUAL_FILES=""
 FILES_FROM=""
 MODE="delete"
 SECRETS_FROM=""
+EXCLUDE_FROM=""
+CANDIDATES_OUT=""
 GITLEAKS_CONFIG=""
 INCLUDE_HEAD_VALUES=false
 ASSUME_YES=false
@@ -117,6 +119,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --secrets-from)
             SECRETS_FROM="$2"
+            shift 2
+            ;;
+        --exclude-from)
+            EXCLUDE_FROM="$2"
+            shift 2
+            ;;
+        --candidates-out)
+            CANDIDATES_OUT="$2"
             shift 2
             ;;
         --gitleaks-config)
@@ -194,6 +204,10 @@ while [[ $# -gt 0 ]]; do
             echo "  --gitleaks-config FILE  gitleaks config to scan with"
             echo "                   (default: .gitleaks.toml in the repo, if present)"
             echo "  --secrets-from FILE  Extra literal secret values to redact, one per line"
+            echo "  --exclude-from FILE  Literal values NEVER to redact, one per line: words and"
+            echo "                   UI text a pattern mistook for a credential (--redact only)"
+            echo "  --candidates-out FILE  Write the exact values that will be replaced to FILE"
+            echo "                   (mode 600, unmasked) so they can be vetted before a run"
             echo "                   (--redact only; merged with what gitleaks finds)"
             echo "  --min-secret-length N  Shortest value to redact (--redact only, default 8)"
             echo "  --replacement TEXT  Replace every value with TEXT (--redact only)"
@@ -257,6 +271,16 @@ if [[ -n "$SECRETS_FROM" && "$SECRETS_FROM" != /* ]]; then
 fi
 if [[ -n "$GITLEAKS_CONFIG" && "$GITLEAKS_CONFIG" != /* ]]; then
     GITLEAKS_CONFIG="$PWD/$GITLEAKS_CONFIG"
+fi
+if [[ -n "$EXCLUDE_FROM" && "$EXCLUDE_FROM" != /* ]]; then
+    EXCLUDE_FROM="$PWD/$EXCLUDE_FROM"
+fi
+if [[ -n "$CANDIDATES_OUT" && "$CANDIDATES_OUT" != /* ]]; then
+    CANDIDATES_OUT="$PWD/$CANDIDATES_OUT"
+fi
+if [[ -n "$EXCLUDE_FROM" && ! -f "$EXCLUDE_FROM" ]]; then
+    echo "Error: --exclude-from file not found: $EXCLUDE_FROM"
+    exit 1
 fi
 if [[ -n "$SECRETS_FROM" && ! -f "$SECRETS_FROM" ]]; then
     echo "Error: --secrets-from file not found: $SECRETS_FROM"
@@ -461,6 +485,13 @@ REJECT_REASON=""
 looks_like_secret() {
     local s="$1" classes=0
     REJECT_REASON=""
+    # Prose, not a credential. The quoted-value sweep reads a translation file's
+    # `"forgotPassword": "Forgot Password"` as a password; every such UI string
+    # has a space, and a generated credential does not. Sweep findings only:
+    # gitleaks findings and --secrets-from values are judged elsewhere.
+    if [[ "$s" == *" "* ]]; then
+        REJECT_REASON="contains a space (text, not a credential)"; return 1
+    fi
     if (( ${#s} < MIN_SECRET_LENGTH )); then
         REJECT_REASON="shorter than --min-secret-length ($MIN_SECRET_LENGTH)"; return 1
     fi
@@ -748,6 +779,18 @@ except Exception:
     # De-duplicate across the sources before ordering.
     sort -u "$out" -o "$out"
 
+    # --exclude-from: values the operator has vetted as NOT credentials (a word
+    # such as `postgres` that is also a table name, UI text). Replacing a word
+    # rewrites every occurrence of it in every file, so an exclusion wins over
+    # every source, --secrets-from included. Each exclusion is listed as a
+    # rejection with its reason, so the run still shows what it chose not to do.
+    if [[ -n "$EXCLUDE_FROM" ]]; then
+        local ex="$GSS_TMPDIR/candidates.exclude"
+        sed -e 's/\r$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$EXCLUDE_FROM" | grep -v '^#' | grep -v '^$' > "$ex" || true
+        awk -F'\n' 'FILENAME == ARGV[1] { ex[$0] = 1; next } ($0 in ex) { print "excluded by --exclude-from\t" $0 }' "$ex" "$out" >> "$rejected"
+        awk 'FILENAME == ARGV[1] { ex[$0] = 1; next } !($0 in ex)' "$ex" "$out" > "$out.kept" && mv "$out.kept" "$out"
+    fi
+
     # A value one gate rejected and another accepted IS being redacted, so it
     # is not a rejection. What is left was dropped by every gate that saw it:
     # one line per value, first reason wins. FILENAME, not NR == FNR: with no
@@ -765,6 +808,9 @@ except Exception:
     if [[ -s "$out" ]]; then
         awk '{ print length($0) "\t" $0 }' "$out" | sort -rn -k1,1 | cut -f2- > "$out.sorted"
         mv "$out.sorted" "$out"
+    fi
+    if [[ -n "$CANDIDATES_OUT" ]]; then
+        ( umask 077; cp "$out" "$CANDIDATES_OUT" )
     fi
 }
 
