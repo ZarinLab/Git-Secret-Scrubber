@@ -23,6 +23,13 @@ against f27e18a and passes now.
   written mode 600, for vetting before `--yes`.
 - The `password=` sweep rejects a value containing a space — UI text, not a
   credential.
+- The sweep rejects a **code expression** — an identifier or member path of
+  four or more characters followed by a call (`DateTime.Now.AddDays(...)`,
+  `Encryptor.EncryptString(...)`), listed with its rule. A rewrite that
+  replaced one would change code in every commit.
+- **PowerShell parity:** `-ExcludeFrom`, `-CandidatesOut` (owner-only: chmod
+  600, icacls on Windows), and the space and code-expression rules. Tests R12
+  (bash) and PR12 (PowerShell) each fail against the previous version.
 - **`--replacement TEXT` / `-Replacement TEXT`** (`--redact` only): every value
   becomes TEXT instead of a numbered `REPLACE_WITH_SECRET_NN`. TEXT must be
   non-empty, one line, free of `==>` (filter-repo's separator), and share nothing

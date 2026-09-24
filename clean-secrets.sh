@@ -512,6 +512,18 @@ looks_like_secret() {
         REJECT_REASON="template expression"; return 1
     fi
 
+    # A code expression: an identifier or member path, then a call. The sweep
+    # takes any right-hand side of `password… =`, so C# like
+    # `ExpireDateOfPassword = DateTime.Now.AddDays(setting.PasswordExpiryDays)`
+    # and `Encryptor.EncryptString(txtPassword.Password, …)` arrive as
+    # candidates -- and a rewrite that replaces them changes code in every
+    # commit (identity-server, infrastructure.api, 2026-09-23). Four or more
+    # identifier characters before the `(` keeps a random credential that
+    # happens to hold a parenthesis out of this rule.
+    if [[ "$s" =~ ^[A-Za-z_][A-Za-z0-9_.]{3,}\( ]]; then
+        REJECT_REASON="code expression (identifier then a call)"; return 1
+    fi
+
     # Segmented identifier paths with no digits: ApiKeys_SendGridApiKeyName,
     # Identity_Api_ClientSecret, Recaptcha_SiteKey, ApiKey.SendGridApiKey,
     # Identity:ClientSecret. These are configuration KEY names -- the

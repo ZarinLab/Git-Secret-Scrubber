@@ -185,6 +185,34 @@ o=$( cd "$d" && runps -Redact -Replacement 'replace.me+text' -GitleaksConfig "$W
 echo "$o" | grep -q 'matched only the replace.me+text placeholders' && echo "$o" | grep -qF "regexes = ['''^replace\.me\+text\$''']" && [ $rc -eq 0 ] \
   && res ok "PR11d placeholder check + allowlist use TEXT" "rc=$rc" || res no "PR11d placeholder check + allowlist use TEXT" "rc=$rc"
 
+# PR12 -- parity with R12 (2026-09-23): code expressions and prose rejected with
+# their rule; -ExcludeFrom keeps an exact value; -CandidatesOut is owner-only.
+mkfix_pr12(){ d=$(newrepo "$1")
+  cat > "$d/Settings.cs" <<'EOF'
+var cs = "Server=pg;User Id=a;Password=Kp9mX2#vT7wQ4nL;Database=a;";
+ExpireDateOfPassword = DateTime.Now.AddDays(setting.PasswordExpiryDays);
+var hashedPassword = Encryptor.EncryptString(txtPassword.Password, key);
+EOF
+  printf '{ "forgotPassword": "Forgot Password", "dbPassword": "postgres12x" }\n' > "$d/en.json"
+  git -C "$d" add -A; git -C "$d" commit -qm c1
+  printf 'var cs = "";\n' > "$d/Settings.cs"; printf '{}\n' > "$d/en.json"
+  git -C "$d" commit -qam c2; echo "$d"; }
+d=$(mkfix_pr12 pr12a)
+o=$( cd "$d" && runps -Redact -DryRun 2>&1 )
+echo "$o" | grep -q 'code expression' && echo "$o" | grep -q 'contains a space' \
+  && res ok "PR12a code/prose rejected with rule" "" || res no "PR12a code/prose rejected with rule" "$(echo "$o" | grep -m1 -E 'distinct|No secret')"
+printf 'postgres12x\n' > "$W/pr12.exclude"
+d=$(mkfix_pr12 pr12c)
+o=$( cd "$d" && runps -Redact -ExcludeFrom "$W/pr12.exclude" -Yes </dev/null 2>&1 ); rc=$?
+allobj(){ git -C "$1" cat-file --batch-all-objects --batch 2>/dev/null; }
+allobj "$d" | grep -aqF 'postgres12x' && ! allobj "$d" | grep -aqF 'Kp9mX2#vT7wQ4nL' \
+  && res ok "PR12c -ExcludeFrom" "rc=$rc" || res no "PR12c -ExcludeFrom" "rc=$rc"
+d=$(mkfix_pr12 pr12d); rm -f "$W/pr12.cand"
+o=$( cd "$d" && runps -Redact -DryRun -CandidatesOut "$W/pr12.cand" 2>&1 )
+m=$(stat -f %Lp "$W/pr12.cand" 2>/dev/null || stat -c %a "$W/pr12.cand" 2>/dev/null)
+[ "$m" = 600 ] && grep -qxF 'Kp9mX2#vT7wQ4nL' "$W/pr12.cand" && ! grep -q 'DateTime' "$W/pr12.cand" \
+  && res ok "PR12d -CandidatesOut" "mode $m" || res no "PR12d -CandidatesOut" "mode=$m"
+
 echo; echo "pwsh: $PASS passed, $FAIL failed"; echo "PSRESULT $PASS $FAIL"
 # CI reads the status, not the summary line.
 [ "$FAIL" -eq 0 ]

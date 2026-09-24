@@ -95,6 +95,10 @@ param(
     [switch]$Redact = $false,
     [switch]$DeleteFiles = $false,
     [string]$SecretsFrom = "",
+    # Exact values NEVER to redact, one per line (words and expressions a person
+    # vetted), and a file to receive the exact values that will be replaced.
+    [string]$ExcludeFrom = "",
+    [string]$CandidatesOut = "",
     [string]$GitleaksConfig = "",
     [switch]$IncludeHeadValues = $false,
     [switch]$Yes = $false,
@@ -133,6 +137,8 @@ if ($Help) {
     Write-Host ""
     Write-Host "Options:" -ForegroundColor Yellow
     Write-Host "  -SecretsFrom FILE      Extra literal secret values to redact, one per line"
+    Write-Host "  -ExcludeFrom FILE      Literal values NEVER to redact, one per line (vetted words, code)"
+    Write-Host "  -CandidatesOut FILE    Write the exact values that will be replaced (owner-only) for vetting"
     Write-Host "                    (-Redact only; bypasses the identifier heuristics)"
     Write-Host "  -MinSecretLength N     Shortest value to redact (-Redact only, default 8)"
     Write-Host "  -GitleaksConfig FILE   gitleaks config to scan with"
@@ -273,6 +279,9 @@ function Export-HistoryObjects {
 # run reported "No secret values found".
 function Get-HeuristicRejectReason {
     param([string]$Value)
+    # Prose, not a credential: a translation file's "Forgot Password" has a
+    # space; a generated credential does not. Sweep findings only.
+    if ($Value.Contains(' ')) { return "contains a space (text, not a credential)" }
     if ($Value.Length -lt $script:MinSecretLen) { return "shorter than -MinSecretLength ($($script:MinSecretLen))" }
 
     # Placeholders and template expressions hold no credential.
@@ -286,6 +295,11 @@ function Get-HeuristicRejectReason {
     # value like `amir-{{ include (print ...) }}` was captured whole by the
     # quoted-value pattern and passed a start-anchored check.
     if ($Value.Contains('{{') -or $Value.Contains('}}') -or $Value.Contains('${')) { return "template expression" }
+
+    # A code expression: an identifier or member path, then a call --
+    # `DateTime.Now.AddDays(setting.PasswordExpiryDays)` arrives from the
+    # `password... =` sweep, and replacing it changes code in every commit.
+    if ($Value -cmatch '^[A-Za-z_][A-Za-z0-9_.]{3,}\(') { return "code expression (identifier then a call)" }
 
     # Provider tokens are segmented too, so exempt them BEFORE the identifier
     # rules below or glpat-/SG./ghp_ values get thrown away as names.
@@ -488,7 +502,29 @@ function Get-SecretCandidates {
     # is not a rejection. The rest were dropped by every gate that saw them.
     $script:RejectedCandidates = @($rejected.Keys | Where-Object { -not $keep.Contains($_) } |
         ForEach-Object { [pscustomobject]@{ Reason = $rejected[$_]; Value = $_ } } | Sort-Object -Property Reason)
-    return @($keep | Sort-Object -Property Length -Descending)
+    # -ExcludeFrom wins over every source, -SecretsFrom included, and each
+    # exclusion is listed as a rejection with its reason.
+    if ($ExcludeFrom) {
+        foreach ($l in Get-Content $ExcludeFrom) {
+            $t = $l.Trim()
+            if (-not $t -or $t.StartsWith('#')) { continue }
+            if ($keep.Remove($t)) {
+                $script:RejectedCandidates += [pscustomobject]@{ Reason = "excluded by -ExcludeFrom"; Value = $t }
+            }
+        }
+    }
+    $sorted = @($keep | Sort-Object -Property Length -Descending)
+    if ($CandidatesOut) {
+        # Owner-only before a single value is written.
+        New-Item -ItemType File -Path $CandidatesOut -Force | Out-Null
+        if ($IsWindows -or $env:OS -eq 'Windows_NT') {
+            & icacls $CandidatesOut /inheritance:r /grant:r "$($env:USERNAME):(R,W)" | Out-Null
+        } else {
+            & chmod 600 $CandidatesOut
+        }
+        [System.IO.File]::WriteAllLines($CandidatesOut, [string[]]$sorted)
+    }
+    return $sorted
 }
 
 # Show a secret without printing it. Length and a three-character prefix let an
@@ -670,6 +706,14 @@ if ($SecretsFrom -and -not [System.IO.Path]::IsPathRooted($SecretsFrom)) {
 }
 if ($GitleaksConfig -and -not [System.IO.Path]::IsPathRooted($GitleaksConfig)) {
     $GitleaksConfig = Join-Path (Get-Location).Path $GitleaksConfig
+}
+foreach ($n in "ExcludeFrom","CandidatesOut") {
+    $v = Get-Variable -Name $n -ValueOnly
+    if ($v -and -not [System.IO.Path]::IsPathRooted($v)) { Set-Variable -Name $n -Value (Join-Path (Get-Location).Path $v) }
+}
+if ($ExcludeFrom -and -not (Test-Path $ExcludeFrom -PathType Leaf)) {
+    Write-Host "Error: -ExcludeFrom file not found: $ExcludeFrom" -ForegroundColor Red
+    exit 1
 }
 if ($SecretsFrom -and -not (Test-Path $SecretsFrom -PathType Leaf)) {
     Write-Host "Error: -SecretsFrom file not found: $SecretsFrom" -ForegroundColor Red

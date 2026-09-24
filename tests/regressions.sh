@@ -206,6 +206,47 @@ o=$( cd "$d" && "$TOOL_SH" --redact --replacement 'replace.me+text' --gitleaks-c
 echo "$o" | grep -q 'matched only the replace.me+text placeholders' && echo "$o" | grep -qF "regexes = ['''^replace\.me\+text\$''']" && [ $rc -eq 0 ] \
   && res ok "R11d placeholder check + allowlist use TEXT" "rc=$rc" || res no "R11d placeholder check + allowlist use TEXT" "rc=$rc"
 
+# R12 -- from the 2026-09-23 estate rewrite (TES plan 0085). The sweep proposed
+# code expressions, UI words and placeholders; a word in the list corrupts
+# every file holding it. One fixture: a real password and three look-alikes,
+# all history-only.
+mkfix_r12(){ d=$(newrepo "$1")
+  cat > "$d/Settings.cs" <<'EOF'
+var cs = "Server=pg;User Id=a;Password=Kp9mX2#vT7wQ4nL;Database=a;";
+ExpireDateOfPassword = DateTime.Now.AddDays(setting.PasswordExpiryDays);
+var hashedPassword = Encryptor.EncryptString(txtPassword.Password, key);
+EOF
+  printf '{ "forgotPassword": "Forgot Password", "dbPassword": "postgres12x" }\n' > "$d/en.json"
+  git -C "$d" add -A; git -C "$d" commit -qm c1
+  printf 'var cs = "";\n' > "$d/Settings.cs"; printf '{}\n' > "$d/en.json"
+  git -C "$d" commit -qam c2; echo "$d"; }
+
+# R12a -- a call expression is rejected WITH its rule; the real password is not.
+d=$(mkfix_r12 r12a)
+o=$( cd "$d" && "$TOOL_SH" --redact --dry-run 2>&1 )
+if echo "$o" | grep -q 'code expression' && echo "$o" | grep -qE 'len=15 +Kp9' && ! echo "$o" | grep -E 'len=[0-9]+ +(Dat|Enc)' | grep -vq 'rejected'; then
+  res ok "R12a code expressions rejected" "real value still proposed"
+else res no "R12a code expressions rejected" "$(echo "$o" | grep -m1 -E 'distinct value|No secret')"; fi
+
+# R12b -- a value with a space is UI text, rejected with its rule.
+echo "$o" | grep -q 'contains a space' && res ok "R12b values with a space rejected" "" || res no "R12b values with a space rejected" ""
+
+# R12c -- --exclude-from: an exact value is never redacted, and says why.
+printf 'postgres12x\n' > "$W/r12.exclude"
+d=$(mkfix_r12 r12c)
+o=$( cd "$d" && "$TOOL_SH" --redact --exclude-from "$W/r12.exclude" --yes </dev/null 2>&1 ); rc=$?
+if all_objects "$d" | grep -aqF 'postgres12x' && ! all_objects "$d" | grep -aqF 'Kp9mX2#vT7wQ4nL' && echo "$o" | grep -q 'exclude-from'; then
+  res ok "R12c --exclude-from" "excluded kept, real value gone (rc=$rc)"
+else res no "R12c --exclude-from" "rc=$rc"; fi
+
+# R12d -- --candidates-out: exactly the values that will be replaced, mode 600.
+d=$(mkfix_r12 r12d); rm -f "$W/r12.cand"
+o=$( cd "$d" && "$TOOL_SH" --redact --dry-run --candidates-out "$W/r12.cand" 2>&1 )
+m=$(stat -f %Lp "$W/r12.cand" 2>/dev/null || stat -c %a "$W/r12.cand" 2>/dev/null)
+if [ "$m" = 600 ] && grep -qxF 'Kp9mX2#vT7wQ4nL' "$W/r12.cand" && ! grep -q 'DateTime' "$W/r12.cand"; then
+  res ok "R12d --candidates-out" "mode $m, exact values"
+else res no "R12d --candidates-out" "mode=$m"; fi
+
 echo
 echo "regressions: $PASS passed, $FAIL failed"
 echo "REGRESSRESULT $PASS $FAIL"
