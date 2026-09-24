@@ -517,7 +517,7 @@ looks_like_secret() {
     # `ExpireDateOfPassword = DateTime.Now.AddDays(setting.PasswordExpiryDays)`
     # and `Encryptor.EncryptString(txtPassword.Password, …)` arrive as
     # candidates -- and a rewrite that replaces them changes code in every
-    # commit (identity-server, infrastructure.api, 2026-09-23). Four or more
+    # commit. Four or more
     # identifier characters before the `(` keeps a random credential that
     # happens to hold a parenthesis out of this rule.
     if [[ "$s" =~ ^[A-Za-z_][A-Za-z0-9_.]{3,}\( ]]; then

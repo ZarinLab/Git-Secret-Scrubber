@@ -206,7 +206,7 @@ o=$( cd "$d" && "$TOOL_SH" --redact --replacement 'replace.me+text' --gitleaks-c
 echo "$o" | grep -q 'matched only the replace.me+text placeholders' && echo "$o" | grep -qF "regexes = ['''^replace\.me\+text\$''']" && [ $rc -eq 0 ] \
   && res ok "R11d placeholder check + allowlist use TEXT" "rc=$rc" || res no "R11d placeholder check + allowlist use TEXT" "rc=$rc"
 
-# R12 -- from the 2026-09-23 estate rewrite (TES plan 0085). The sweep proposed
+# R12 -- from a large multi-repository rewrite. The sweep proposed
 # code expressions, UI words and placeholders; a word in the list corrupts
 # every file holding it. One fixture: a real password and three look-alikes,
 # all history-only.

@@ -15,8 +15,8 @@ against f27e18a and passes now.
 ### Added
 - **`--exclude-from FILE`** (bash): literal values NEVER to redact, one per
   line — code expressions, UI words, placeholders a person vetted. They are
-  listed among the rejects with the reason. Used on the 2026-09-23 estate
-  rewrite, where the dry runs proposed `DateTime.Now.AddDays(...)`, locale
+  listed among the rejects with the reason. Found on a large
+  multi-repository rewrite, where the dry runs proposed `DateTime.Now.AddDays(...)`, locale
   strings and `postgres`; the scrubber replaces a value everywhere, so one
   word in the list corrupts every file that contains it.
 - **`--candidates-out FILE`** (bash): the exact values that will be replaced,
